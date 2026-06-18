@@ -136,6 +136,9 @@ class CostDistribution:
     p90: float = field(init=False)
     cvar: float = field(init=False)
     cvar_alpha: float = 0.95
+    # Bootstrap confidence intervals (Improvement #5)
+    ci_mean: tuple = field(default_factory=lambda: (0.0, 0.0))
+    ci_cvar: tuple = field(default_factory=lambda: (0.0, 0.0))
 
     def __post_init__(self):
         self.mean = float(self.costs.mean())
