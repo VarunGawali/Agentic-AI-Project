@@ -72,6 +72,8 @@ class PriceForecast:
     horizon: int = field(init=False)
     n_paths: int = field(init=False)
     model_name: str = "GBM"    # which model produced this (GBM, GARCH-t, ...)
+    frequency: str = "D"       # "D" daily, "W" weekly, "M" monthly
+    calibration_window: Optional[int] = None  # rows of history used to fit drift/vol
 
     def __post_init__(self):
         self.n_paths, self.horizon = self.paths.shape
