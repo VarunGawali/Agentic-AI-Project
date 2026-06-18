@@ -1,6 +1,12 @@
 """
 Test script: verifies the LangGraph plan-and-execute workflow runs end-to-end.
 """
+import sys, os
+# The hedging_assistant namespace package lives in the shared checkout root
+_shared = "/home/user/Agentic-AI-Project"
+if _shared not in sys.path:
+    sys.path.insert(0, _shared)
+
 from hedging_assistant.data.loader import load_price_history, make_exposure_book, default_risk_appetite
 from hedging_assistant.agent.langgraph_agent import run_agent
 from hedging_assistant.agent.orchestrator import HedgingAgent
