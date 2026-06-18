@@ -25,8 +25,9 @@ from hedging_assistant.engines.scorer import score_policy
 
 
 class HedgingAgent:
-    def __init__(self, risk: RiskAppetite):
+    def __init__(self, risk: RiskAppetite, use_langgraph: bool = False):
         self.risk = risk
+        self.use_langgraph = use_langgraph
 
     # --- STEP 1 --------------------------------------------------------------
     def assess(self, history: PriceHistory, horizon: int) -> list[StrategyParams]:
@@ -91,6 +92,9 @@ class HedgingAgent:
     # --- FULL PASS -----------------------------------------------------------
     def recommend(self, history: PriceHistory, exposure: ExposureBook,
                   forward_price: float) -> Recommendation:
+        if self.use_langgraph:
+            from hedging_assistant.agent.langgraph_agent import run_agent
+            return run_agent(history, exposure, self.risk, forward_price)
         horizon = exposure.horizon
         candidates = self.assess(history, horizon)
         fc = self.forecast(history, horizon)
