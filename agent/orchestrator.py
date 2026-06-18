@@ -18,9 +18,10 @@ from hedging_assistant.contracts import (
     PriceHistory, ExposureBook, RiskAppetite,
     StrategyType, StrategyParams, Recommendation, CandidateRecord,
 )
-from hedging_assistant.engines.engines import (
-    forecast, build_policy, simulate_cost, score_policy,
-)
+from hedging_assistant.engines.forecaster import forecast
+from hedging_assistant.engines.strategy_library import build_policy, generate_staggered_candidates
+from hedging_assistant.engines.cost_simulator import simulate_cost
+from hedging_assistant.engines.scorer import score_policy
 
 
 class HedgingAgent:
@@ -34,10 +35,9 @@ class HedgingAgent:
         BASELINE: enumerate staggered fractions.
         UPGRADE : LLM inspects market state + risk appetite to prune the space.
         """
-        return [
-            StrategyParams(strategy_type=StrategyType.STAGGERED, base_fraction=f)
-            for f in np.linspace(0.0, self.risk.max_hedge, 11)
-        ]
+        return generate_staggered_candidates(
+            max_hedge=self.risk.max_hedge, n_steps=11, cap=self.risk.max_hedge
+        )
 
     # --- STEP 2 --------------------------------------------------------------
     def forecast(self, history: PriceHistory, horizon: int):
