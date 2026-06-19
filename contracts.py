@@ -11,6 +11,13 @@ stable interface, and each becomes trivial to expose as an Azure Function later
 (every contract is JSON-serialisable via asdict()).
 
 Nothing here contains logic -- only the shapes of the data.
+
+CHANGES:
+  - Added ForwardCurve: term structure of forward prices (replaces scalar).
+    Backward-compat via ForwardCurve.flat(price, horizon).
+  - Added RunConfig: pins all reproducibility parameters for a run.
+    Stored in Recommendation.run_config for audit trail support.
+  - Recommendation.run_config field added (Optional[RunConfig]).
 """
 
 from __future__ import annotations
@@ -56,6 +63,58 @@ class RiskAppetite:
     w_execution: float = 0.25
     cvar_alpha: float = 0.95   # tail level for CVaR (worst 5%)
     max_hedge: float = 1.0     # hard limit: never hedge more than this fraction
+
+
+@dataclass
+class ForwardCurve:
+    """
+    Term structure of forward prices, one per delivery period.
+    Replaces the single scalar forward_price in the simulator.
+
+    CHANGES: New contract — enables per-period forward pricing instead of
+             flat scalar. Backward-compatible: ForwardCurve.flat(p, H)
+             creates the old scalar behaviour.
+    """
+    prices: np.ndarray   # shape (H,) forward price per delivery period USD/bbl
+    horizon: int = field(init=False)
+    source: str = "synthetic"   # "EIA", "ICE", "synthetic"
+
+    def __post_init__(self):
+        self.horizon = len(self.prices)
+
+    @classmethod
+    def flat(cls, price: float, horizon: int, source: str = "synthetic") -> "ForwardCurve":
+        """Backward-compat: flat curve = single scalar repeated H times."""
+        return cls(prices=np.full(horizon, price), source=source)
+
+
+@dataclass
+class RunConfig:
+    """
+    CHANGES: New contract — pins all reproducibility parameters for a run.
+    Stored inside Recommendation.assumptions so any run can be exactly replicated.
+    Critical for audit trails at regulated institutions.
+    """
+    n_paths: int = 10_000
+    seed: int = 42
+    frequency: str = "D"
+    calibration_window: Optional[int] = None
+    distribution: str = "normal"        # "normal" or "student-t"
+    use_regime: bool = False
+    cvar_alpha: float = 0.95
+    label: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "n_paths": self.n_paths,
+            "seed": self.seed,
+            "frequency": self.frequency,
+            "calibration_window": self.calibration_window,
+            "distribution": self.distribution,
+            "use_regime": self.use_regime,
+            "cvar_alpha": self.cvar_alpha,
+            "label": self.label,
+        }
 
 
 # ----------------------------------------------------------------------------
@@ -136,6 +195,9 @@ class CostDistribution:
     p90: float = field(init=False)
     cvar: float = field(init=False)
     cvar_alpha: float = 0.95
+    # Bootstrap confidence intervals (Improvement #5)
+    ci_mean: tuple = field(default_factory=lambda: (0.0, 0.0))
+    ci_cvar: tuple = field(default_factory=lambda: (0.0, 0.0))
 
     def __post_init__(self):
         self.mean = float(self.costs.mean())
@@ -186,6 +248,7 @@ class Recommendation:
     rationale: str                          # plain-English explanation
     trace: list[CandidateRecord] = field(default_factory=list)
     assumptions: dict = field(default_factory=dict)
+    run_config: Optional["RunConfig"] = None   # reproducibility record
 
 
 # ----------------------------------------------------------------------------

@@ -1,0 +1,126 @@
+
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║              AGENTIC CRUDE PROCUREMENT & HEDGING DECISION ASSISTANT             ║
+║                          Full Architecture — Phase 1 + LangGraph                ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  DATA LAYER                                                                     │
+│                                                                                 │
+│  ┌──────────────────────┐    ┌───────────────────┐    ┌──────────────────────┐ │
+│  │  EIA Open Data API   │    │  Synthetic WTI    │    │  ExposureBook        │ │
+│  │  WTI (RWTC)          │───▶│  Fallback         │    │  100k bbl/month × 6  │ │
+│  │  Brent (RBRTE)       │    │  (mean-rev + jump)│    │                      │ │
+│  │  2010 → present      │    └───────────────────┘    │  RiskAppetite        │ │
+│  │  Paginated + dedup   │            │                 │  w_cost, w_cvar,     │ │
+│  └──────────────────────┘            │                 │  max_hedge=1.0       │ │
+│              │                       │                 └──────────────────────┘ │
+│              └───────────────────────┘                          │               │
+│                          │ PriceHistory                         │               │
+└──────────────────────────┼──────────────────────────────────────┼───────────────┘
+                           │                                      │
+                           ▼                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  LANGGRAPH PLAN-AND-EXECUTE AGENT  (agent/langgraph_agent.py)                  │
+│                                                                                 │
+│  AgentState flows through 5 nodes, each appending to messages[]                │
+│                                                                                 │
+│  ┌───────────┐    ┌───────────┐    ┌───────────┐    ┌───────────┐    ┌───────┐ │
+│  │  ASSESS   │───▶│ FORECAST  │───▶│  EXPLORE  │───▶│ ARBITRATE │───▶│EXPLAIN│ │
+│  │           │    │           │    │           │    │           │    │       │ │
+│  │ Generate  │    │ GBM-Sobol │    │ Parallel  │    │ Min       │    │ Build │ │
+│  │ staggered │    │ 10k paths │    │ sweep via │    │ blended   │    │ policy│ │
+│  │ candidates│    │ Sobol +   │    │ Process-  │    │ score     │    │ write │ │
+│  │ 0%→100%   │    │ antithetic│    │ Pool-     │    │ wins      │    │ ratio-│ │
+│  │ 11 steps  │    │ AIC calib │    │ Executor  │    │ Phase 2:  │    │ nale  │ │
+│  │           │    │ window    │    │ 11 cands  │    │ LLM trade-│    │ + CIs │ │
+│  │ Phase 2:  │    │ joblib    │    │ in parall.│    │ off anal. │    │       │ │
+│  │ LLM prune │    │ cache     │    │           │    │           │    │Phase 2│ │
+│  └───────────┘    └───────────┘    └───────────┘    └───────────┘    │LLM txt│ │
+│                                                                       └───────┘ │
+└──────────────────────────────────────────┬──────────────────────────────────────┘
+                                           │ Recommendation
+                                           │
+              ┌────────────────────────────┼─────────────────────────────┐
+              │                            │                             │
+              ▼                            ▼                             ▼
+┌─────────────────────┐      ┌─────────────────────────┐    ┌───────────────────┐
+│  ANALYTICS ENGINES  │      │  ANALYTICS ENGINES      │    │  ANALYTICS ENGINE │
+│  (called by FORECAST)│      │  (called by EXPLORE)   │    │  (called by EXPLN)│
+│                     │      │                         │    │                   │
+│  engines/           │      │  engines/               │    │  engines/         │
+│  forecaster.py      │      │  strategy_library.py    │    │  cost_simulator   │
+│  ─────────────────  │      │  ───────────────────    │    │  ───────────────  │
+│  • prepare_price_   │      │  • apply_strategy()     │    │  • simulate_cost  │
+│    series()         │      │  • build_policy()       │    │    (vectorized)   │
+│  • select_calib_    │      │  • generate_staggered_  │    │  • bootstrap CI   │
+│    window() (AIC)   │      │    candidates()         │    │    on mean+CVaR   │
+│  • forecast() GBM   │      │  • generate_batch_      │    │                   │
+│    Sobol+antithetic │      │    candidates()         │    │  engines/         │
+│    joblib cache     │      │                         │    │  scorer.py        │
+│                     │      │  engines/               │    │  ─────────────── │
+│  PriceForecast out  │      │  cost_simulator.py      │    │  • score_policy() │
+│  (n_paths, horizon) │      │  ───────────────────    │    │  • evaluate_cands │
+│                     │      │  • simulate_cost()      │    │    (parallel)     │
+└─────────────────────┘      │    fully vectorized     │    └───────────────────┘
+                             │  • dual-mode accurate/  │
+                             │    optimized            │
+                             │  • _bootstrap_ci()      │
+                             └─────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  GOVERNANCE + OUTPUT  (produced by EXPLAIN node)                                │
+│                                                                                 │
+│  Recommendation                                                                 │
+│  ├── HedgingPolicy  (hedge_fractions[H], StrategyParams)                       │
+│  ├── CostDistribution  (mean, p10/p50/p90, CVaR, ci_mean, ci_cvar)            │
+│  ├── FactorScore  (cost, cvar, opp_cost=0*, exec_risk=0*)  * Phase 3           │
+│  ├── rationale  (plain-English explanation)                                     │
+│  ├── trace[]  (all candidates considered + scores)                              │
+│  └── assumptions  (forward_price, model, n_paths, frequency)                   │
+│                                    │                                            │
+│                          ┌─────────▼──────────┐                                │
+│                          │  HUMAN APPROVAL     │  ← decision support,           │
+│                          │  approve / override │    never auto-execute          │
+│                          └────────────────────┘                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  OFFLINE VALIDATION (backtest/validate.py)  — NOT in live flow                 │
+│                                                                                 │
+│  walk_forward_validate()                                                        │
+│  ├── Decision windows: train=1000, test=21, step=63 rows                       │
+│  ├── Strict info cutoff at each date (no look-ahead)                           │
+│  ├── 4 cost baselines per window:                                               │
+│  │     strategy (agent) │ no-hedge │ perfect-foresight │ naive-50%             │
+│  └── captured_fraction = agent improvement / theoretical max  → [0,1]         │
+│                                                                                 │
+│  USE: run before + after each upgrade (GBM→GARCH, 2-factor→4-factor)          │
+│       to QUANTIFY improvement. Revert if captured_fraction drops.             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  QUANT PERFORMANCE FEATURES                                                     │
+│  ① Vectorized MC      — matrix ops, no Python loops in hot path                │
+│  ② Multiprocessing    — ProcessPoolExecutor, parallel candidate sweep          │
+│  ③ Sobol sequences    — O(1/N) convergence vs O(1/√N) plain MC                │
+│  ④ Antithetic variates— halved estimator variance, zero extra paths            │
+│  ⑤ Bootstrap 95% CIs — on mean cost and CVaR (500 resamples)                  │
+│  ⑥ AIC window select  — auto-calibrates GBM fit window from history            │
+│  ⑦ joblib path cache  — skips GBM recompute on identical inputs               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  DATA CONTRACTS (contracts.py) — JSON-serialisable, Azure-Function-ready       │
+│                                                                                 │
+│  PriceHistory → PriceForecast → [StrategyParams → HedgingPolicy]              │
+│               → CostDistribution → FactorScore → Recommendation               │
+│                                                                                 │
+│  CandidateRecord[]  (decision trace)    BacktestResult  (offline)              │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+PHASE ROADMAP
+  Phase 1 (now)  ──  GBM-Sobol + staggered + vectorized MC + backtester  ✓
+  Phase 2        ──  LLM nodes in ASSESS/ARBITRATE/EXPLAIN + Streamlit UI + Azure deploy
+  Phase 3        ──  GARCH-t forecaster + trigger/vol strategies + 4-factor scorer
+  Phase 4        ──  Conversational surface + polish + demo

@@ -9,6 +9,11 @@ over the ASSESS and ARBITRATE judgement steps and writes the EXPLAIN text.
 The point of stubbing it this way: the agentic *structure* (assess -> forecast
 -> explore -> arbitrate -> explain) exists from day one, and swapping the plain
 logic for LLM-driven logic later does not change the pipeline shape.
+
+CHANGES:
+  - HedgingAgent accepts RunConfig; threads it into forecast() calls
+  - Recommendation.run_config populated with the RunConfig used
+  - Imports moved from engines.engines stub to proper module paths
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import numpy as np
 from hedging_assistant.contracts import (
     PriceHistory, ExposureBook, RiskAppetite,
     StrategyType, StrategyParams, Recommendation, CandidateRecord,
+    RunConfig,
 )
 from hedging_assistant.engines.forecaster import forecast
 from hedging_assistant.engines.strategy_library import build_policy, generate_staggered_candidates
@@ -25,8 +31,11 @@ from hedging_assistant.engines.scorer import score_policy
 
 
 class HedgingAgent:
-    def __init__(self, risk: RiskAppetite):
+    def __init__(self, risk: RiskAppetite, use_langgraph: bool = False,
+                 run_config: RunConfig | None = None):
         self.risk = risk
+        self.use_langgraph = use_langgraph
+        self.run_config = run_config or RunConfig()
 
     # --- STEP 1 --------------------------------------------------------------
     def assess(self, history: PriceHistory, horizon: int) -> list[StrategyParams]:
@@ -41,7 +50,12 @@ class HedgingAgent:
 
     # --- STEP 2 --------------------------------------------------------------
     def forecast(self, history: PriceHistory, horizon: int):
-        return forecast(history, horizon, seed=0)
+        rc = self.run_config
+        return forecast(history, horizon,
+                        n_paths=rc.n_paths, seed=rc.seed,
+                        frequency=rc.frequency,
+                        calibration_window=rc.calibration_window,
+                        use_cache=True)
 
     # --- STEP 3 --------------------------------------------------------------
     def explore(self, candidates, forecast_obj, exposure, forward_price):
@@ -81,16 +95,21 @@ class HedgingAgent:
             f"({best.params.strategy_type.value}). Expected cost "
             f"${cost.mean:,.0f}; worst-case (CVaR) ${cost.cvar:,.0f}."
         )
-        return Recommendation(
+        rec = Recommendation(
             policy=policy, cost=cost, score=best.score,
             rationale=rationale, trace=records,
             assumptions={"forward_price": forward_price,
                          "model": forecast_obj.model_name},
         )
+        rec.run_config = self.run_config
+        return rec
 
     # --- FULL PASS -----------------------------------------------------------
     def recommend(self, history: PriceHistory, exposure: ExposureBook,
                   forward_price: float) -> Recommendation:
+        if self.use_langgraph:
+            from hedging_assistant.agent.langgraph_agent import run_agent
+            return run_agent(history, exposure, self.risk, forward_price)
         horizon = exposure.horizon
         candidates = self.assess(history, horizon)
         fc = self.forecast(history, horizon)
