@@ -7,6 +7,10 @@ BASELINE (Phase 1): path-wise simulation with per-path strategy application,
 UPGRADES:
   #1  Vectorized Monte Carlo — no per-path loop in either mode
   #5  Bootstrap confidence intervals on mean and CVaR
+
+CHANGES:
+  - simulate_cost now accepts ForwardCurve in addition to scalar forward_price
+  - Added marginal_cvar() function: decomposes CVaR by period
 """
 
 from __future__ import annotations
@@ -46,7 +50,7 @@ def simulate_cost(
     forecast_obj: PriceForecast,
     exposure: ExposureBook,
     params: StrategyParams,
-    forward_price: float,
+    forward_price,          # float OR ForwardCurve
     cvar_alpha: float = 0.95,
     mode: str = "accurate",
 ) -> CostDistribution:
@@ -65,7 +69,7 @@ def simulate_cost(
         forecast_obj: PriceForecast with paths (n_paths, horizon)
         exposure: ExposureBook with volumes (horizon,)
         params: StrategyParams defining the hedging rule
-        forward_price: price locked in for hedged volumes (USD/bbl)
+        forward_price: price locked in for hedged volumes — float (USD/bbl) or ForwardCurve
         cvar_alpha: tail level for CVaR computation (default 0.95 = worst 5%)
         mode: "accurate" or "optimized" — both fully vectorized now;
               mode parameter kept for API compatibility
@@ -73,10 +77,7 @@ def simulate_cost(
     Returns:
         CostDistribution with per-path costs, summary stats, and bootstrap CIs
     """
-    if forward_price <= 0:
-        raise ValueError(f"forward_price must be positive; got {forward_price}")
-    if not (0 < cvar_alpha < 1):
-        raise ValueError(f"cvar_alpha must be in (0, 1); got {cvar_alpha}")
+    from hedging_assistant.contracts import ForwardCurve
 
     paths = np.asarray(forecast_obj.paths, dtype=float)       # (n_paths, horizon)
     volumes = np.asarray(exposure.volumes, dtype=float)        # (horizon,)
@@ -87,10 +88,18 @@ def simulate_cost(
             f"exposure.volumes length {len(volumes)} != forecast horizon {horizon}"
         )
 
+    # Resolve forward price to a curve
+    if isinstance(forward_price, ForwardCurve):
+        fwd_curve = np.asarray(forward_price.prices, dtype=float)
+    else:
+        if forward_price <= 0:
+            raise ValueError(f"forward_price must be positive; got {forward_price}")
+        fwd_curve = np.full(horizon, float(forward_price))
+
+    if not (0 < cvar_alpha < 1):
+        raise ValueError(f"cvar_alpha must be in (0, 1); got {cvar_alpha}")
+
     # Improvement #1: vectorized form — safe for path-independent strategies.
-    # For staggered strategies, apply_strategy returns a constant fraction array
-    # regardless of which path is provided, so using paths[0] is equivalent to
-    # using any other path or computing per-path individually.
     frac = apply_strategy(params, paths[0])   # shape (horizon,)
     if len(frac) != horizon:
         raise ValueError(
@@ -99,8 +108,8 @@ def simulate_cost(
     if np.any(frac < 0) or np.any(frac > 1):
         raise ValueError("hedge fractions must be in [0, 1]")
 
-    hedged_cost = (frac * volumes * forward_price).sum()           # scalar
-    unhedged_costs = ((1.0 - frac) * volumes * paths).sum(axis=1) # (n_paths,)
+    hedged_cost = (frac * volumes * fwd_curve).sum()             # scalar
+    unhedged_costs = ((1.0 - frac) * volumes * paths).sum(axis=1)  # (n_paths,)
     total_costs = hedged_cost + unhedged_costs
 
     # Improvement #5: bootstrap CIs on mean and CVaR
@@ -116,3 +125,44 @@ def simulate_cost(
     dist.ci_mean = ci_mean
     dist.ci_cvar = ci_cvar
     return dist
+
+
+def marginal_cvar(
+    forecast_obj: PriceForecast,
+    exposure: ExposureBook,
+    params: StrategyParams,
+    forward_price,
+    cvar_alpha: float = 0.95,
+) -> np.ndarray:
+    """
+    Marginal CVaR decomposition by period.
+
+    Returns shape (horizon,) array where entry t is the contribution of period t
+    to the overall CVaR — i.e. mean cost in period t conditional on being in the
+    tail. Tells the trader which delivery month drives tail risk most.
+
+    Computed as: for each path in the CVaR tail, extract per-period costs,
+    then average across tail paths.
+    """
+    from hedging_assistant.contracts import ForwardCurve
+    paths = np.asarray(forecast_obj.paths, dtype=float)
+    volumes = np.asarray(exposure.volumes, dtype=float)
+    n_paths, horizon = paths.shape
+
+    frac = apply_strategy(params, paths[0])
+    if isinstance(forward_price, ForwardCurve):
+        fwd_curve = np.asarray(forward_price.prices, dtype=float)
+    else:
+        fwd_curve = np.full(horizon, float(forward_price))
+
+    # per-path, per-period costs: shape (n_paths, horizon)
+    period_costs = (
+        frac * volumes * fwd_curve +           # hedged portion (scalar per period)
+        (1.0 - frac) * volumes * paths         # unhedged portion
+    )
+    total_costs = period_costs.sum(axis=1)     # shape (n_paths,)
+
+    threshold = np.percentile(total_costs, cvar_alpha * 100)
+    tail_mask = total_costs >= threshold       # bool (n_paths,)
+    tail_period_costs = period_costs[tail_mask]  # shape (n_tail, horizon)
+    return tail_period_costs.mean(axis=0)      # shape (horizon,)

@@ -8,6 +8,11 @@ UPGRADES:
       (O(1/N) convergence; halves estimator variance simultaneously)
   #4  joblib.Memory path caching
   #6  AIC-based rolling calibration window selection
+
+CHANGES:
+  - Added `distribution` param: "normal" (default) or "student-t" (fat tails)
+  - Added `use_regime` param: when True, calls detect_regime() and uses regime-specific mu/sigma
+  - Student-t: fits degrees-of-freedom via scipy.stats.t.fit on log-returns
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import pandas as pd
 from pathlib import Path
 
 import joblib
+import scipy.stats
 from scipy.stats import qmc, norm as scipy_norm
 
 from hedging_assistant.contracts import PriceHistory, PriceForecast
@@ -123,6 +129,8 @@ def _forecast_impl(
     seed,
     frequency: str,
     calibration_window,
+    distribution: str = "normal",
+    use_regime: bool = False,
 ) -> np.ndarray:
     """
     Core GBM path simulation, cached by joblib.Memory.
@@ -154,18 +162,38 @@ def _forecast_impl(
     if sigma <= 0:
         raise ValueError("Computed volatility is zero — price series has no variation.")
 
+    # Feature 2: HMM regime override
+    if use_regime:
+        from hedging_assistant.engines.regime import detect_regime
+        regime = detect_regime(s)
+        mu = float(regime.mu[regime.current_regime])
+        sigma = float(regime.sigma[regime.current_regime])
+        print(f"[forecaster] Regime: {regime.label} (p={regime.regime_probs[regime.current_regime]:.2f})")
+
     s0 = float(s.iloc[-1])
 
     # Improvement #3: Sobol + antithetic variates
     half = n_paths // 2
     sobol_engine = qmc.Sobol(d=horizon, scramble=True, seed=seed)
     u = sobol_engine.random(half)           # shape (half, horizon) in [0,1]
-    z_pos = scipy_norm.ppf(u)               # transform to standard normal
+
+    # Feature 2: Student-t or normal quantile transformation
+    if distribution == "student-t":
+        df, loc, scale = scipy.stats.t.fit(log_ret, floc=mu)
+        print(f"[forecaster] Student-t df={df:.1f}")
+        z_pos = scipy.stats.t.ppf(u, df=df, loc=0, scale=scale)
+    else:
+        z_pos = scipy_norm.ppf(u)           # transform to standard normal
+
     z_neg = -z_pos                          # antithetic mirror
     z = np.vstack([z_pos, z_neg])           # (2*half, horizon)
     if n_paths % 2 == 1:
         rng = np.random.default_rng(seed)
-        extra = rng.standard_normal((1, horizon))
+        if distribution == "student-t":
+            extra = scipy.stats.t.rvs(df=df, loc=0, scale=scale, size=(1, horizon),
+                                      random_state=np.random.default_rng(seed))
+        else:
+            extra = rng.standard_normal((1, horizon))
         z = np.vstack([z, extra])
 
     increments = (mu - 0.5 * sigma ** 2) + sigma * z
@@ -181,6 +209,8 @@ def forecast(
     frequency: str = "D",
     calibration_window: int | None = None,
     use_cache: bool = True,
+    distribution: str = "normal",
+    use_regime: bool = False,
 ) -> PriceForecast:
     """
     GBM forecaster with Sobol+antithetic sampling and optional joblib caching.
@@ -206,6 +236,7 @@ def forecast(
         paths = cached_fn(
             history.prices, dates_str, history.symbol,
             horizon, n_paths, seed, frequency, calibration_window,
+            distribution, use_regime,
         )
         print("[forecaster] Cache hit — returning cached paths.")
     else:
@@ -213,11 +244,22 @@ def forecast(
         paths = _forecast_impl(
             history.prices, dates_str, history.symbol,
             horizon, n_paths, seed, frequency, calibration_window,
+            distribution, use_regime,
         )
+
+    # Determine model name suffix
+    if use_regime and distribution == "student-t":
+        model_name = "GBM-Sobol-HMM-t"
+    elif use_regime:
+        model_name = "GBM-Sobol-HMM"
+    elif distribution == "student-t":
+        model_name = "GBM-Sobol-t"
+    else:
+        model_name = "GBM-Sobol"
 
     return PriceForecast(
         paths=paths,
-        model_name="GBM-Sobol",
+        model_name=model_name,
         frequency=frequency,
         calibration_window=calibration_window,
     )

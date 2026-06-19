@@ -7,10 +7,15 @@ LangGraph StateGraph with explicit nodes:
 
 All nodes are deterministic Python (no LLM calls). Phase 2 will add LLM-driven
 ASSESS and ARBITRATE nodes plus an LLM-written EXPLAIN rationale.
+
+CHANGES:
+  - Fixed AgentState to use TypedDict (required by LangGraph >= 1.x).
+    Previous dict subclass approach lost keys after state transitions.
 """
 
 from __future__ import annotations
-from typing import Any
+from typing import Any, Optional
+from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, END
 
@@ -31,23 +36,21 @@ from hedging_assistant.engines.scorer import score_policy, evaluate_candidates
 # State schema
 # ---------------------------------------------------------------------------
 
-class AgentState(dict):
+class AgentState(TypedDict, total=False):
     """
     Typed dictionary carrying the workflow state between nodes.
-
-    Keys:
-        history         : PriceHistory
-        exposure        : ExposureBook
-        risk            : RiskAppetite
-        forward_price   : float
-        candidates      : list[StrategyParams] | None
-        forecast_obj    : PriceForecast | None
-        records         : list[CandidateRecord] | None
-        no_hedge_cost   : CostDistribution | None
-        best            : CandidateRecord | None
-        recommendation  : Recommendation | None
-        trace_messages  : list[str]
     """
+    history: Any
+    exposure: Any
+    risk: Any
+    forward_price: float
+    candidates: Any
+    forecast_obj: Any
+    records: Any
+    no_hedge_cost: Any
+    best: Any
+    recommendation: Any
+    trace_messages: list
 
 
 def _initial_state(
@@ -76,11 +79,6 @@ def _initial_state(
 # ---------------------------------------------------------------------------
 
 def node_assess(state: AgentState) -> AgentState:
-    """
-    ASSESS: Generate candidate StrategyParams to evaluate.
-    BASELINE: enumerates a staggered fraction grid.
-    UPGRADE (Phase 2): LLM inspects market state + risk appetite to prune/extend.
-    """
     risk: RiskAppetite = state["risk"]
     candidates = generate_staggered_candidates(
         max_hedge=risk.max_hedge,
@@ -88,16 +86,11 @@ def node_assess(state: AgentState) -> AgentState:
         cap=risk.max_hedge,
     )
     msg = f"[node_assess] Generated {len(candidates)} staggered candidates."
-    state["candidates"] = candidates
-    state["trace_messages"] = state["trace_messages"] + [msg]
     print(msg)
-    return state
+    return {"candidates": candidates, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 
 def node_forecast(state: AgentState) -> AgentState:
-    """
-    FORECAST: Run GBM-Sobol forecaster to produce a PriceForecast.
-    """
     history: PriceHistory = state["history"]
     exposure: ExposureBook = state["exposure"]
     fc = forecast(history, exposure.horizon, seed=0)
@@ -105,23 +98,16 @@ def node_forecast(state: AgentState) -> AgentState:
         f"[node_forecast] Produced {fc.n_paths} paths x {fc.horizon} steps "
         f"({fc.model_name})."
     )
-    state["forecast_obj"] = fc
-    state["trace_messages"] = state["trace_messages"] + [msg]
     print(msg)
-    return state
+    return {"forecast_obj": fc, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 
 def node_explore(state: AgentState) -> AgentState:
-    """
-    EXPLORE: Evaluate all candidates using evaluate_candidates and also
-    compute no-hedge cost for baseline comparison.
-    """
     forecast_obj = state["forecast_obj"]
     exposure: ExposureBook = state["exposure"]
     risk: RiskAppetite = state["risk"]
     forward_price: float = state["forward_price"]
 
-    # Compute no-hedge baseline cost
     no_hedge_params = StrategyParams(
         strategy_type=StrategyType.STAGGERED,
         base_fraction=0.0,
@@ -130,8 +116,6 @@ def node_explore(state: AgentState) -> AgentState:
         forecast_obj, exposure, no_hedge_params, forward_price,
     )
 
-    # Evaluate all candidates; evaluate_candidates returns list[dict]
-    # with keys: params, cost, score
     results = evaluate_candidates(
         forecast_obj=forecast_obj,
         exposure=exposure,
@@ -139,7 +123,6 @@ def node_explore(state: AgentState) -> AgentState:
         forward_price=forward_price,
     )
 
-    # Convert to CandidateRecord list
     records = [
         CandidateRecord(
             params=r["params"],
@@ -153,19 +136,15 @@ def node_explore(state: AgentState) -> AgentState:
         f"[node_explore] Evaluated {len(records)} candidates. "
         f"No-hedge mean cost: ${no_hedge_cost.mean:,.0f}."
     )
-    state["records"] = records
-    state["no_hedge_cost"] = no_hedge_cost
-    state["trace_messages"] = state["trace_messages"] + [msg]
     print(msg)
-    return state
+    return {
+        "records": records,
+        "no_hedge_cost": no_hedge_cost,
+        "trace_messages": state.get("trace_messages", []) + [msg],
+    }
 
 
 def node_arbitrate(state: AgentState) -> AgentState:
-    """
-    ARBITRATE: Pick the best candidate (minimum blended score).
-    BASELINE: deterministic argmin.
-    UPGRADE (Phase 2): LLM reasons about trade-offs vs risk appetite.
-    """
     records: list[CandidateRecord] = state["records"]
     best = min(records, key=lambda r: r.score.blended)
     best.accepted = True
@@ -174,18 +153,11 @@ def node_arbitrate(state: AgentState) -> AgentState:
         f"{best.params.base_fraction:.0%} staggered, "
         f"blended score={best.score.blended:,.0f}."
     )
-    state["best"] = best
-    state["trace_messages"] = state["trace_messages"] + [msg]
     print(msg)
-    return state
+    return {"best": best, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 
 def node_explain(state: AgentState) -> AgentState:
-    """
-    EXPLAIN: Build HedgingPolicy, write rationale, create Recommendation.
-    BASELINE: template-based rationale string.
-    UPGRADE (Phase 2): LLM writes nuanced explanation.
-    """
     best: CandidateRecord = state["best"]
     forecast_obj = state["forecast_obj"]
     exposure: ExposureBook = state["exposure"]
@@ -216,10 +188,11 @@ def node_explain(state: AgentState) -> AgentState:
     )
 
     msg = "[node_explain] Recommendation built."
-    state["recommendation"] = recommendation
-    state["trace_messages"] = state["trace_messages"] + [msg]
     print(msg)
-    return state
+    return {
+        "recommendation": recommendation,
+        "trace_messages": state.get("trace_messages", []) + [msg],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +200,6 @@ def node_explain(state: AgentState) -> AgentState:
 # ---------------------------------------------------------------------------
 
 def _build_graph() -> Any:
-    """Build and compile the LangGraph StateGraph."""
     builder = StateGraph(AgentState)
 
     builder.add_node("assess", node_assess)
@@ -246,7 +218,6 @@ def _build_graph() -> Any:
     return builder.compile()
 
 
-# Compile once at module import
 _graph = _build_graph()
 
 
@@ -262,15 +233,6 @@ def run_agent(
 ) -> Recommendation:
     """
     Run the full LangGraph plan-and-execute workflow and return a Recommendation.
-
-    Args:
-        history:       historical price data
-        exposure:      volumes required per future period
-        risk:          client risk appetite (weights, CVaR alpha, max hedge)
-        forward_price: current forward/futures price for hedged volumes
-
-    Returns:
-        Recommendation with policy, cost distribution, score, rationale, trace
     """
     initial = _initial_state(history, exposure, risk, forward_price)
     final_state = _graph.invoke(initial)
