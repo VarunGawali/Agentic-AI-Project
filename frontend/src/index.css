@@ -1,0 +1,90 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --black: #0a0a0a;
+  --black-mid: #111111;
+  --black-card: #181818;
+  --black-border: #2a2a2a;
+  --yellow: #f5c518;
+  --yellow-dim: #c9a010;
+  --yellow-glow: rgba(245, 197, 24, 0.15);
+  --white: #f0f0f0;
+  --white-dim: #aaaaaa;
+  --red: #e05c5c;
+  --green: #4caf7d;
+  --font: 'Inter', 'Segoe UI', sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--black);
+  color: var(--white);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--black-mid); }
+::-webkit-scrollbar-thumb { background: var(--black-border); border-radius: 3px; }
+
+.card {
+  background: var(--black-card);
+  border: 1px solid var(--black-border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+.card-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--white-dim);
+  margin-bottom: 10px;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.tag-yellow { background: var(--yellow-glow); border: 1px solid var(--yellow); color: var(--yellow); }
+.tag-green  { background: rgba(76,175,125,0.15); border: 1px solid var(--green); color: var(--green); }
+.tag-red    { background: rgba(224,92,92,0.15);  border: 1px solid var(--red);   color: var(--red); }
+.tag-dim    { background: #1e1e1e; border: 1px solid var(--black-border); color: var(--white-dim); }
+
+button { font-family: var(--font); cursor: pointer; border: none; }
+
+.btn-primary {
+  width: 100%;
+  padding: 10px;
+  background: var(--yellow);
+  color: var(--black);
+  font-weight: 800;
+  font-size: 13px;
+  border-radius: 6px;
+  letter-spacing: 0.05em;
+  transition: background 0.15s;
+}
+.btn-primary:hover { background: var(--yellow-dim); }
+.btn-primary:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid var(--black-border);
+  border-top-color: var(--yellow);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.num { font-family: var(--mono); }
