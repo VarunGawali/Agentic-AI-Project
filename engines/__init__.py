@@ -3,3 +3,4 @@ from hedging_assistant.engines.strategy_library import apply_strategy, build_pol
 from hedging_assistant.engines.cost_simulator import simulate_cost, marginal_cvar
 from hedging_assistant.engines.scorer import score_policy, evaluate_candidates
 from hedging_assistant.engines.regime import RegimeState, detect_regime
+from hedging_assistant.engines.optimizer import optimize_cvar_lp, tune_strategy_params
