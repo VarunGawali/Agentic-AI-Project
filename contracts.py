@@ -18,6 +18,9 @@ CHANGES:
   - Added RunConfig: pins all reproducibility parameters for a run.
     Stored in Recommendation.run_config for audit trail support.
   - Recommendation.run_config field added (Optional[RunConfig]).
+  - Phase 3: Added HYBRID and DP_OPTIMAL to StrategyType.
+  - Phase 3: StrategyParams extended with vol_scale_k, ma_window, dp_table
+    for hybrid and Bellman-optimal strategies.
 """
 
 from __future__ import annotations
@@ -147,24 +150,35 @@ class PriceForecast:
 # ----------------------------------------------------------------------------
 
 class StrategyType(str, Enum):
-    STAGGERED = "staggered"
-    TRIGGER = "trigger"
+    STAGGERED  = "staggered"
+    TRIGGER    = "trigger"
     VOLATILITY = "volatility"
+    HYBRID     = "hybrid"       # trigger × vol combined signal
+    DP_OPTIMAL = "dp_optimal"   # Bellman-optimal policy via backward induction
 
 
 @dataclass
 class StrategyParams:
-    """Parameters that specialise a strategy type into a concrete rule."""
+    """
+    Parameters that specialise a strategy type into a concrete rule.
+
+    CHANGES (Phase 3):
+      - vol_scale_k: sensitivity of vol-scaling (VOLATILITY / HYBRID)
+      - ma_window: look-back periods for moving-average trigger (TRIGGER / HYBRID)
+      - dp_table: pre-computed Bellman policy {(t, price_bin, vol_bin): frac}
+                  built by strategy_library.build_dp_table(); None until built.
+    """
     strategy_type: StrategyType
-    # staggered: uses base_fraction
-    # trigger:   uses base_fraction + trigger_price + trigger_fraction
-    # volatility:uses base_fraction + vol_threshold + vol_fraction
     base_fraction: float = 0.0
-    trigger_price: Optional[float] = None
-    trigger_fraction: Optional[float] = None
-    vol_threshold: Optional[float] = None
-    vol_fraction: Optional[float] = None
-    cap: float = 1.0           # max cumulative hedge fraction allowed
+    # TRIGGER / HYBRID — price momentum signal
+    trigger_threshold: float = 1.0   # hedge high_frac when price/MA > threshold
+    trigger_fraction:  float = 0.8   # hedge fraction when trigger fires
+    ma_window: int = 5               # periods of look-back for moving average
+    # VOLATILITY / HYBRID — vol-scaling signal
+    vol_scale_k: float = 1.0         # vol-sensitivity: frac *= (1 + k*(rv/lrv - 1))
+    # DP_OPTIMAL — pre-computed lookup table
+    dp_table: Optional[dict] = None  # {(t, price_bin, vol_bin): frac}; built offline
+    cap: float = 1.0                 # hard ceiling on hedge fraction
 
 
 @dataclass

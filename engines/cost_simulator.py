@@ -11,6 +11,9 @@ UPGRADES:
 CHANGES:
   - simulate_cost now accepts ForwardCurve in addition to scalar forward_price
   - Added marginal_cvar() function: decomposes CVaR by period
+  - Phase 3: simulate_cost forks on is_path_dependent(); STAGGERED/CVaR-LP
+    fracs stay fully vectorised; TRIGGER/VOLATILITY/HYBRID/DP_OPTIMAL loop
+    per-path so each path sees its own state-dependent fraction schedule.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import numpy as np
 from hedging_assistant.contracts import (
     PriceForecast, ExposureBook, StrategyParams, CostDistribution,
 )
-from hedging_assistant.engines.strategy_library import apply_strategy
+from hedging_assistant.engines.strategy_library import apply_strategy, is_path_dependent
 
 
 def _bootstrap_ci(
@@ -99,18 +102,30 @@ def simulate_cost(
     if not (0 < cvar_alpha < 1):
         raise ValueError(f"cvar_alpha must be in (0, 1); got {cvar_alpha}")
 
-    # Improvement #1: vectorized form — safe for path-independent strategies.
-    frac = apply_strategy(params, paths[0])   # shape (horizon,)
-    if len(frac) != horizon:
-        raise ValueError(
-            f"apply_strategy returned {len(frac)} fractions; expected {horizon}"
-        )
-    if np.any(frac < 0) or np.any(frac > 1):
-        raise ValueError("hedge fractions must be in [0, 1]")
+    if is_path_dependent(params):
+        # Path-dependent strategies: each path sees its own fraction schedule
+        # based on the prices it realises — must loop.
+        total_costs = np.empty(n_paths)
+        for i in range(n_paths):
+            frac = apply_strategy(params, paths[i])
+            total_costs[i] = (
+                (frac * volumes * fwd_curve).sum()
+                + ((1.0 - frac) * volumes * paths[i]).sum()
+            )
+    else:
+        # Improvement #1: vectorized — safe for path-independent strategies.
+        # apply_strategy returns the same fracs for any path, so compute once.
+        frac = apply_strategy(params, paths[0])   # shape (horizon,)
+        if len(frac) != horizon:
+            raise ValueError(
+                f"apply_strategy returned {len(frac)} fractions; expected {horizon}"
+            )
+        if np.any(frac < 0) or np.any(frac > 1):
+            raise ValueError("hedge fractions must be in [0, 1]")
 
-    hedged_cost = (frac * volumes * fwd_curve).sum()             # scalar
-    unhedged_costs = ((1.0 - frac) * volumes * paths).sum(axis=1)  # (n_paths,)
-    total_costs = hedged_cost + unhedged_costs
+        hedged_cost    = (frac * volumes * fwd_curve).sum()
+        unhedged_costs = ((1.0 - frac) * volumes * paths).sum(axis=1)
+        total_costs    = hedged_cost + unhedged_costs
 
     # Improvement #5: bootstrap CIs on mean and CVaR
     def _cvar_stat(c: np.ndarray) -> float:
