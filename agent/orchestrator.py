@@ -55,7 +55,10 @@ class HedgingAgent:
                         n_paths=rc.n_paths, seed=rc.seed,
                         frequency=rc.frequency,
                         calibration_window=rc.calibration_window,
-                        use_cache=True)
+                        use_cache=True,
+                        distribution=rc.distribution,
+                        use_regime=rc.use_regime,
+                        model=getattr(rc, "model", "gbm"))
 
     # --- STEP 3 --------------------------------------------------------------
     def explore(self, candidates, forecast_obj, exposure, forward_price):

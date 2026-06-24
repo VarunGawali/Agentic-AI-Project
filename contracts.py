@@ -106,6 +106,7 @@ class RunConfig:
     use_regime: bool = False
     cvar_alpha: float = 0.95
     label: str = ""
+    model: str = "gbm"   # "gbm", "xgb-garch-t"
 
     def to_dict(self) -> dict:
         return {
@@ -117,6 +118,7 @@ class RunConfig:
             "use_regime": self.use_regime,
             "cvar_alpha": self.cvar_alpha,
             "label": self.label,
+            "model": self.model,
         }
 
 

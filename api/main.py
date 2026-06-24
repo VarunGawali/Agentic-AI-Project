@@ -45,7 +45,7 @@ class RecommendRequest(BaseModel):
     horizon: int = Field(6, ge=1, le=24)
     max_hedge: float = Field(1.0, ge=0, le=1)
     cvar_weight: float = Field(1.0, ge=0, le=5)
-    model: str = Field("normal", pattern="^(normal|student-t|hmm)$")
+    model: str = Field("normal", pattern="^(normal|student-t|hmm|xgb-garch-t)$")
     n_paths: int = Field(2000, ge=100, le=20000)
 
 class StressRequest(BaseModel):
@@ -111,6 +111,7 @@ def recommend(req: RecommendRequest):
         frequency="M",
         distribution="student-t" if req.model == "student-t" else "normal",
         use_regime=(req.model == "hmm"),
+        model="xgb-garch-t" if req.model == "xgb-garch-t" else "gbm",
     )
 
     agent = HedgingAgent(risk=risk, run_config=run_config)

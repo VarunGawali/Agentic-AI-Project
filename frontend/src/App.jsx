@@ -197,12 +197,12 @@ export default function App() {
           <div className="sidebar-section-title" style={{ marginTop: 4 }}>Model</div>
 
           <div className="model-toggle">
-            {['normal', 'student-t', 'hmm'].map(m => (
+            {['normal', 'student-t', 'hmm', 'xgb-garch-t'].map(m => (
               <div key={m}
                 className={`model-option ${params.model === m ? 'active' : ''}`}
                 onClick={() => handleSliderChange('model', m)}>
                 <div className="model-dot" />
-                {{ normal: 'GBM Normal', 'student-t': 'GBM Student-t', hmm: 'GBM + HMM Regime' }[m]}
+                {{ normal: 'GBM Normal', 'student-t': 'GBM Student-t', hmm: 'GBM + HMM Regime', 'xgb-garch-t': 'XGB + GARCH-t' }[m]}
               </div>
             ))}
           </div>
