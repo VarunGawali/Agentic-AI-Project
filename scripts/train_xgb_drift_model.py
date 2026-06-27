@@ -33,8 +33,8 @@ except ImportError as exc:
         "xgboost is not installed. Run: uv pip install xgboost"
     ) from exc
 
-from data.loader import load_price_history
-from engines.features import FEATURE_COLUMNS, make_supervised_dataset
+from hedging_assistant.data.loader import load_price_history
+from hedging_assistant.engines.features import FEATURE_COLUMNS, make_supervised_dataset
 
 
 MODEL_DIR = Path("models")

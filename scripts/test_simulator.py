@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from contracts import (
+from hedging_assistant.contracts import (
     PriceHistory,
     ExposureBook,
     StrategyParams,
@@ -9,9 +9,9 @@ from contracts import (
     RiskAppetite,
 )
 
-from engines.forecaster import forecast
-from engines.cost_simulator import simulate_cost
-from engines.scorer import find_best_staggered_hedge
+from hedging_assistant.engines.forecaster import forecast
+from hedging_assistant.engines.cost_simulator import simulate_cost
+from hedging_assistant.engines.scorer import find_best_staggered_hedge
 
 
 # ---------------------------------------------------------

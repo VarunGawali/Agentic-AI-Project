@@ -1,5 +1,4 @@
 from hedging_assistant.engines.forecaster import forecast, prepare_price_series
-from hedging_assistant.engines.xgb_garch_forecaster import XGBGARCHForecaster
 from hedging_assistant.engines.features import FEATURE_COLUMNS, build_features
 from hedging_assistant.engines.strategy_library import apply_strategy, build_policy, generate_staggered_candidates, generate_batch_candidates
 from hedging_assistant.engines.cost_simulator import simulate_cost, marginal_cvar
