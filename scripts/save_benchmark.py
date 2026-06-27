@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from contracts import PriceHistory, ExposureBook, RiskAppetite
-from backtest.validate import walk_forward_validate
+from hedging_assistant.contracts import PriceHistory, ExposureBook, RiskAppetite
+from hedging_assistant.backtest.validate import walk_forward_validate
 
 
 def main():

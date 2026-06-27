@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from contracts import PriceHistory, ExposureBook, RiskAppetite
-from agent.langgraph_workflow import run_agent
+from hedging_assistant.contracts import PriceHistory, ExposureBook, RiskAppetite
+from hedging_assistant.agent.langgraph_workflow import run_agent
 
 
 df = pd.read_csv("data/raw/wti_price_history.csv")

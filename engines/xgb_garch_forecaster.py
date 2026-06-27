@@ -21,8 +21,8 @@ import pandas as pd
 import scipy.stats
 from scipy.stats import qmc
 
-from contracts import PriceHistory, PriceForecast
-from engines.features import (
+from hedging_assistant.contracts import PriceHistory, PriceForecast
+from hedging_assistant.engines.features import (
     FEATURE_COLUMNS,
     build_features,
 )

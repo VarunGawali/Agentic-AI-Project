@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from contracts import (
+from hedging_assistant.contracts import (
     PriceForecast,
     ExposureBook,
     RiskAppetite,

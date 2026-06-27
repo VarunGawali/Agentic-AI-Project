@@ -37,7 +37,7 @@ import numpy as np
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
-from contracts import (
+from hedging_assistant.contracts import (
     PriceHistory,
     ExposureBook,
     RiskAppetite,
@@ -47,13 +47,13 @@ from contracts import (
     Recommendation,
 )
 
-from engines.forecaster import forecast
-from engines.strategy_library import (
+from hedging_assistant.engines.forecaster import forecast
+from hedging_assistant.engines.strategy_library import (
     build_policy,
     generate_batch_candidates,
 )
-from engines.cost_simulator import simulate_cost
-from engines.scorer import evaluate_candidates
+from hedging_assistant.engines.cost_simulator import simulate_cost
+from hedging_assistant.engines.scorer import evaluate_candidates
 
 
 import json
@@ -455,7 +455,7 @@ def node_explore(state: AgentState) -> dict:
     # ---------------------------------------------------------
 
     try:
-        from engines.optimizer import optimize_cvar_lp_params
+        from hedging_assistant.engines.optimizer import optimize_cvar_lp_params
 
         cvar_lp_params = optimize_cvar_lp_params(
             forecast_obj=forecast_obj,

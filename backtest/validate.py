@@ -23,16 +23,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from contracts import (
+from hedging_assistant.contracts import (
     PriceHistory,
     ExposureBook,
     RiskAppetite,
     BacktestResult,
 )
 
-from engines.forecaster import forecast, prepare_price_series
-from engines.scorer import find_best_staggered_hedge
-from engines.strategy_library import build_policy
+from hedging_assistant.engines.forecaster import forecast, prepare_price_series
+from hedging_assistant.engines.scorer import find_best_staggered_hedge
+from hedging_assistant.engines.strategy_library import build_policy
 
 
 def _realized_cost(

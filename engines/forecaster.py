@@ -24,14 +24,14 @@ from importlib import import_module
 from pathlib import Path
 
 import joblib
-from engines.xgb_garch_forecaster import forecast_xgb_garch_t
+from hedging_assistant.engines.xgb_garch_forecaster import forecast_xgb_garch_t
 import numpy as np
 import pandas as pd
 import scipy.stats
 from scipy.stats import norm as scipy_norm
 from scipy.stats import qmc
 
-from contracts import PriceHistory, PriceForecast
+from hedging_assistant.contracts import PriceHistory, PriceForecast
 
 
 # ---------------------------------------------------------------------------

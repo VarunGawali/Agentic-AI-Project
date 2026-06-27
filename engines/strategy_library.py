@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from contracts import (
+from hedging_assistant.contracts import (
     StrategyType,
     StrategyParams,
     HedgingPolicy,

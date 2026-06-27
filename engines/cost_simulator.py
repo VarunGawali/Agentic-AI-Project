@@ -25,14 +25,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from contracts import (
+from hedging_assistant.contracts import (
     PriceForecast,
     ExposureBook,
     StrategyParams,
     CostDistribution,
 )
 
-from engines.strategy_library import apply_strategy, is_path_dependent
+from hedging_assistant.engines.strategy_library import apply_strategy, is_path_dependent
 
 
 # ---------------------------------------------------------------------------

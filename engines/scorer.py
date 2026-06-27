@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from contracts import (
+from hedging_assistant.contracts import (
     PriceForecast,
     ExposureBook,
     RiskAppetite,
@@ -38,8 +38,8 @@ from contracts import (
     FactorScore,
 )
 
-from engines.cost_simulator import simulate_cost
-from engines.strategy_library import (
+from hedging_assistant.engines.cost_simulator import simulate_cost
+from hedging_assistant.engines.strategy_library import (
     apply_strategy,
     generate_staggered_candidates,
 )
