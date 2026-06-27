@@ -1,8 +1,8 @@
 """
-XGB- design:XGB-GARCH-t forecaster.
+XGB-GJR-GARCH-t forecaster.
     - XGBoost drift model is trained offline by scripts/train_xgb_drift_model.py.
     - This module loads the trained XGBoost model.
-    - GARCH(1,1)-t is fitted on recent XGBoost residuals.
+    - GJR-GARCH(1,1)-t is fitted on recent XGBoost residuals (captures leverage effect).
     - Future paths are simulated using:
 
         log_return_t = xgb_drift_t + sigma_t * t_shock_t
@@ -342,11 +342,14 @@ def fit_garch_t_on_residuals(
 
     residuals_pct = residuals * 100.0
 
+    # GJR-GARCH (o=1) captures the leverage effect: crashes drive more vol
+    # than equivalent upside moves, which is well-documented in crude oil.
     model = arch_model(
         residuals_pct,
         mean="Zero",
         vol="GARCH",
         p=1,
+        o=1,
         q=1,
         dist="t",
         rescale=False,
@@ -361,6 +364,7 @@ def fit_garch_t_on_residuals(
 
     omega = float(params.get("omega", 0.01))
     alpha = float(params.get("alpha[1]", 0.05))
+    gamma = float(params.get("gamma[1]", 0.0))  # asymmetric leverage term
     beta = float(params.get("beta[1]", 0.90))
     nu = float(params.get("nu", 8.0))
 
@@ -368,10 +372,15 @@ def fit_garch_t_on_residuals(
 
     conditional_vol_pct = np.asarray(result.conditional_volatility, dtype=float)
 
-    last_sigma2_pct = float(conditional_vol_pct[-1] ** 2)
+    # Regime-aware warm-start: use the average variance over the most recent
+    # 120 days (≈ 6 months) rather than the single last value, which can be
+    # noisy and unrepresentative of the current vol regime.
+    recent_window = min(120, len(conditional_vol_pct))
+    last_sigma2_pct = float(np.mean(conditional_vol_pct[-recent_window:] ** 2))
     last_residual_pct = float(residuals_pct[-1])
 
-    persistence = alpha + beta
+    # GJR-GARCH persistence includes half the leverage term (E[I_{<0}] = 0.5).
+    persistence = alpha + 0.5 * gamma + beta
 
     if persistence < 1.0:
         denominator = max(1.0 - persistence, 1e-8)
@@ -382,6 +391,7 @@ def fit_garch_t_on_residuals(
     return {
         "omega": omega,
         "alpha": alpha,
+        "gamma": gamma,
         "beta": beta,
         "nu": nu,
         "last_sigma2_pct": last_sigma2_pct,
@@ -653,8 +663,8 @@ def simulate_xgb_garch_paths(
     seed: int | None = 42,
     daily_steps: int = 21,
     use_sobol: bool = True,
-    drift_scale: float = 0.25,
-    drift_clip: float = 0.01,
+    drift_scale: float = 0.6,
+    drift_clip: float = 0.025,
     debug: bool = False,
 ) -> np.ndarray:
     """
@@ -686,6 +696,7 @@ def simulate_xgb_garch_paths(
 
     omega = float(garch_params["omega"])
     alpha = float(garch_params["alpha"])
+    gamma = float(garch_params.get("gamma", 0.0))
     beta = float(garch_params["beta"])
     nu = float(garch_params["nu"])
     long_run_vol = float(garch_params["long_run_vol"])
@@ -740,14 +751,18 @@ def simulate_xgb_garch_paths(
 
         feature_frame = feature_frame[feature_columns]
 
-        # One XGBoost call for all paths.
-        # One XGBoost call for all paths.
         drift = xgb_model.predict(feature_frame).astype(float)
 
-        # Guardrail:
-        # XGBoost is used as a weak conditional drift estimator.
-        # GARCH-t should drive most of the stochastic variation.
-        drift = drift * drift_scale
+        # Scale XGBoost drift; then add path-conditional noise proportional
+        # to each path's current realized vol relative to the long-run mean.
+        # This gives genuine path diversity in the drift dimension.
+        rv_5d_per_path = feature_frame["rv_5d"].to_numpy(dtype=float)
+        vol_ratio = np.where(
+            long_run_vol > 0,
+            rv_5d_per_path / max(long_run_vol, 1e-8),
+            1.0,
+        )
+        drift = drift * drift_scale * (0.7 + 0.3 * vol_ratio)
         drift = np.clip(drift, -drift_clip, drift_clip)
 
         if debug and step in {0, 20, 60, 120}:
@@ -761,10 +776,12 @@ def simulate_xgb_garch_paths(
                 np.sqrt(sigma2_pct).mean() / 100.0,
             )
 
-        # GARCH update in percent units.
+        # GJR-GARCH update: indicator = 1 when last residual was negative
+        # (adverse shock), adding gamma * residual^2 for leverage effect.
+        indicator = np.where(last_residual_pct < 0, 1.0, 0.0)
         sigma2_pct = (
             omega
-            + alpha * (last_residual_pct ** 2)
+            + (alpha + gamma * indicator) * (last_residual_pct ** 2)
             + beta * sigma2_pct
         )
 
@@ -814,8 +831,8 @@ def forecast_xgb_garch_t(
     model_path: str | Path = DEFAULT_MODEL_PATH,
     feature_columns_path: str | Path = DEFAULT_FEATURE_COLUMNS_PATH,
     use_sobol: bool = True,
-    drift_scale: float = 0.25,
-    drift_clip: float = 0.01,
+    drift_scale: float = 0.6,
+    drift_clip: float = 0.025,
     debug: bool = False,
 ) -> PriceForecast:
     """
