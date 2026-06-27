@@ -1,0 +1,43 @@
+{
+  "model_type": "xgb_drift",
+  "created_at": "2026-06-25T09:58:19.989546Z",
+  "symbol": "WTI",
+  "start": "2010-01-01",
+  "seed": 42,
+  "train_fraction": 0.85,
+  "warmup": 60,
+  "feature_columns": [
+    "sin_month",
+    "cos_month",
+    "log_ret_lag1",
+    "log_ret_lag5",
+    "log_ret_lag21",
+    "rv_5d",
+    "rv_21d",
+    "price_dev_60d",
+    "rsi_14",
+    "eia_inventory_chg"
+  ],
+  "target": "next_period_log_return",
+  "rows_used_after_warmup": 4072,
+  "first_target_date": "2010-04-01",
+  "last_target_date": "2026-06-22",
+  "metrics": {
+    "train_rows": 3461,
+    "validation_rows": 611,
+    "train_rmse": 0.023145377341796884,
+    "validation_rmse": 0.026056929461674677,
+    "train_mae": 0.016279775950760193,
+    "validation_mae": 0.017932072196935968,
+    "validation_directional_accuracy": 0.48936170212765956,
+    "target_mean": -1.3644297611282656e-05,
+    "target_std": 0.03002098768301858,
+    "prediction_mean_validation": 0.00012436196266207844,
+    "prediction_std_validation": 0.004949095193296671
+  },
+  "notes": [
+    "XGBoost predicts conditional drift / expected next-period log return.",
+    "GARCH-t forecaster will model volatility and fat-tailed residual shocks separately.",
+    "eia_inventory_chg is optional and should be zero during forward simulation unless scenario values are supplied."
+  ]
+}

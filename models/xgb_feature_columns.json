@@ -1,0 +1,12 @@
+[
+  "sin_month",
+  "cos_month",
+  "log_ret_lag1",
+  "log_ret_lag5",
+  "log_ret_lag21",
+  "rv_5d",
+  "rv_21d",
+  "price_dev_60d",
+  "rsi_14",
+  "eia_inventory_chg"
+]

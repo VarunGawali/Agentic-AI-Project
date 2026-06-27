@@ -1,160 +1,448 @@
 """
 Scorer: evaluates and ranks hedging candidates.
 
-BASELINE (Phase 1): sweeps a hedge-ratio grid, simulates each, scores on
-  cost + CVaR (2-factor). Opportunity cost and execution risk are stubbed at 0.
-UPGRADE:
-  #2  Multiprocessing candidate sweep via ProcessPoolExecutor
+Phase 1:
+    - Sweep staggered hedge ratios
+    - Simulate each policy
+    - Score using expected cost + CVaR
+
+Phase 3:
+    - Four-factor scoring:
+        Score =
+            w_cost * Expected Cost
+          + w_cvar * CVaR
+          + w_opportunity * Opportunity Cost
+          + w_execution * Execution Risk
+
+    - Opportunity cost:
+        Mean regret vs no-hedge when strategy is more expensive than no hedge.
+
+    - Execution risk:
+        Simple transaction/operational-cost proxy based on hedged volume.
+
+    - Supports rule-based candidates plus optimizer-generated strategies
+      such as CVAR_LP.
 """
 
 from __future__ import annotations
-import os
+
 import numpy as np
-import concurrent.futures
 
-from hedging_assistant.contracts import (
-    PriceForecast, ExposureBook, RiskAppetite,
-    StrategyType, StrategyParams, CostDistribution, FactorScore,
+from contracts import (
+    PriceForecast,
+    ExposureBook,
+    RiskAppetite,
+    StrategyType,
+    StrategyParams,
+    CostDistribution,
+    FactorScore,
 )
-from hedging_assistant.engines.cost_simulator import simulate_cost
 
-DEFAULT_HEDGE_GRID = np.linspace(0.0, 1.0, 11)   # 0%, 10%, ..., 100%
+from engines.cost_simulator import simulate_cost
+from engines.strategy_library import (
+    apply_strategy,
+    generate_staggered_candidates,
+)
 
+
+DEFAULT_HEDGE_GRID = [0.0, 0.25, 0.50, 0.75, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Factor helpers
+# ---------------------------------------------------------------------------
+
+def compute_opportunity_cost(
+    cost: CostDistribution,
+    no_hedge_cost: CostDistribution,
+) -> float:
+    """
+    Compute opportunity cost / regret versus no-hedge.
+
+    Interpretation:
+        If the hedge strategy costs more than no hedge in a scenario,
+        that excess is treated as missed upside.
+
+    Formula:
+        opportunity_cost =
+            mean(max(strategy_cost_i - no_hedge_cost_i, 0))
+    """
+
+    strategy_costs = np.asarray(cost.costs, dtype=float)
+    baseline_costs = np.asarray(no_hedge_cost.costs, dtype=float)
+
+    if strategy_costs.shape != baseline_costs.shape:
+        raise ValueError(
+            "cost.costs and no_hedge_cost.costs must have the same shape "
+            "to compute opportunity cost."
+        )
+
+    regret = np.maximum(strategy_costs - baseline_costs, 0.0)
+
+    return float(regret.mean())
+
+
+def estimate_hedge_fractions_for_execution(
+    params: StrategyParams,
+    horizon: int,
+    forecast_obj: PriceForecast | None = None,
+) -> np.ndarray:
+    """
+    Estimate representative hedge schedule for execution-risk calculation.
+
+    For path-independent strategies:
+        Uses fixed/base schedule directly.
+
+    For path-dependent strategies:
+        Uses median forecast path as representative schedule.
+
+    This avoids running execution-risk calculation path-by-path, while still
+    giving a reasonable operational burden proxy.
+    """
+
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+
+    # CVAR_LP / fixed schedule
+    if params.strategy_type == StrategyType.CVAR_LP:
+        if params.fixed_fractions is None:
+            raise ValueError("CVAR_LP requires fixed_fractions.")
+
+        fractions = np.asarray(params.fixed_fractions, dtype=float)
+
+        if len(fractions) != horizon:
+            raise ValueError(
+                f"CVAR_LP fixed_fractions length {len(fractions)} does not "
+                f"match horizon {horizon}"
+            )
+
+        return np.clip(fractions, 0.0, params.cap)
+
+    # STAGGERED schedule
+    if params.strategy_type == StrategyType.STAGGERED:
+        return np.full(
+            horizon,
+            min(float(params.base_fraction), float(params.cap)),
+            dtype=float,
+        )
+
+    # Path-dependent strategies use median forecast path.
+    if forecast_obj is not None:
+        paths = np.asarray(forecast_obj.paths, dtype=float)
+
+        if paths.ndim != 2:
+            raise ValueError("forecast_obj.paths must be 2D")
+
+        if paths.shape[1] != horizon:
+            raise ValueError(
+                f"forecast horizon={paths.shape[1]} does not match expected "
+                f"horizon={horizon}"
+            )
+
+        median_path = np.percentile(paths, 50, axis=0)
+
+        return apply_strategy(
+            params=params,
+            price_path=median_path,
+        )
+
+    # Fallback if no forecast object is available.
+    return np.full(
+        horizon,
+        min(float(params.base_fraction), float(params.cap)),
+        dtype=float,
+    )
+
+
+def compute_execution_risk(
+    params: StrategyParams,
+    exposure: ExposureBook | None = None,
+    forecast_obj: PriceForecast | None = None,
+    execution_cost_per_barrel: float = 0.05,
+) -> float:
+    """
+    Compute execution risk as a simple transaction/operational burden proxy.
+
+    Formula:
+        execution_risk =
+            sum_t(hedge_fraction_t * volume_t) * execution_cost_per_barrel
+
+    Units:
+        dollars, assuming execution_cost_per_barrel is USD/bbl.
+
+    Why this simple proxy:
+        - Larger hedge volumes are operationally harder.
+        - Larger hedge volumes have more brokerage/spread/slippage exposure.
+        - It gives the scorer a way to penalize over-hedging.
+
+    Later versions can add:
+        - turnover penalty
+        - liquidity penalty
+        - concentration penalty
+        - complexity penalty by strategy type
+    """
+
+    if execution_cost_per_barrel < 0:
+        raise ValueError("execution_cost_per_barrel cannot be negative")
+
+    if exposure is None:
+        # Backward-compatible fallback.
+        # No exposure means we cannot compute dollar execution burden.
+        return 0.0
+
+    volumes = np.asarray(exposure.volumes, dtype=float)
+
+    if volumes.ndim != 1:
+        raise ValueError("exposure.volumes must be 1D")
+
+    if np.any(volumes < 0):
+        raise ValueError("exposure volumes cannot be negative")
+
+    horizon = len(volumes)
+
+    fractions = estimate_hedge_fractions_for_execution(
+        params=params,
+        horizon=horizon,
+        forecast_obj=forecast_obj,
+    )
+
+    if len(fractions) != horizon:
+        raise ValueError(
+            f"execution hedge schedule length {len(fractions)} does not match "
+            f"exposure horizon {horizon}"
+        )
+
+    if np.any((fractions < 0) | (fractions > 1)):
+        raise ValueError("execution hedge fractions must be between 0 and 1")
+
+    hedged_volume = float(np.sum(fractions * volumes))
+
+    return hedged_volume * float(execution_cost_per_barrel)
+
+
+# ---------------------------------------------------------------------------
+# Main scoring
+# ---------------------------------------------------------------------------
 
 def score_policy(
     cost: CostDistribution,
     no_hedge_cost: CostDistribution,
     params: StrategyParams,
     risk: RiskAppetite,
+    exposure: ExposureBook | None = None,
+    forecast_obj: PriceForecast | None = None,
+    execution_cost_per_barrel: float = 0.05,
 ) -> FactorScore:
     """
-    Score a single policy against the no-hedge baseline.
+    Score one hedge policy using the four-factor objective.
 
-    BASELINE: 2-factor (cost + lambda*CVaR). Opportunity cost and execution risk
-    are set to 0 until Phase 3.
+    Formula:
+        Score =
+            w_cost * Expected Cost
+          + w_cvar * CVaR
+          + w_opportunity * Opportunity Cost
+          + w_execution * Execution Risk
+
+    Lower blended score is better.
     """
-    cost_factor = cost.mean
-    cvar_factor = cost.cvar
-    opp = 0.0    # Phase 3: regret when prices fall and we over-hedged
-    exe = 0.0    # Phase 3: operational execution difficulty proxy
-    blended = risk.w_cost * cost_factor + risk.w_cvar * cvar_factor
+
+    cost_factor = float(cost.mean)
+    cvar_factor = float(cost.cvar)
+
+    opportunity_cost = compute_opportunity_cost(
+        cost=cost,
+        no_hedge_cost=no_hedge_cost,
+    )
+
+    execution_risk = compute_execution_risk(
+        params=params,
+        exposure=exposure,
+        forecast_obj=forecast_obj,
+        execution_cost_per_barrel=execution_cost_per_barrel,
+    )
+
+    blended = (
+        risk.w_cost * cost_factor
+        + risk.w_cvar * cvar_factor
+        + risk.w_opportunity * opportunity_cost
+        + risk.w_execution * execution_risk
+    )
+
     return FactorScore(
         cost=cost_factor,
         cvar=cvar_factor,
-        opportunity_cost=opp,
-        execution_risk=exe,
-        blended=blended,
+        opportunity_cost=opportunity_cost,
+        execution_risk=execution_risk,
+        blended=float(blended),
     )
 
 
-# Module-level worker function required for pickling with ProcessPoolExecutor
-def _evaluate_single_candidate(args):
-    """Worker for parallel candidate evaluation. Must be module-level for pickling."""
-    ratio, forecast_paths, exposure_volumes, forward_price, cvar_alpha, max_hedge = args
-
-    import numpy as np
-    from hedging_assistant.contracts import (
-        PriceForecast, ExposureBook, StrategyType, StrategyParams,
-    )
-    from hedging_assistant.engines.cost_simulator import simulate_cost
-
-    fc_obj = PriceForecast(paths=forecast_paths, model_name="GBM-Sobol")
-    exp_obj = ExposureBook(volumes=exposure_volumes)
-    params = StrategyParams(
-        strategy_type=StrategyType.STAGGERED,
-        base_fraction=float(ratio),
-        cap=float(max_hedge),
-    )
-    cost = simulate_cost(fc_obj, exp_obj, params, forward_price, cvar_alpha=cvar_alpha)
-    return ratio, params, cost
-
+# ---------------------------------------------------------------------------
+# Candidate evaluation
+# ---------------------------------------------------------------------------
 
 def evaluate_candidates(
     forecast_obj: PriceForecast,
     exposure: ExposureBook,
     risk: RiskAppetite,
-    forward_price: float,
-    hedge_ratio_grid: np.ndarray | None = None,
-    n_workers: int | None = None,
+    forward_price,
+    hedge_ratio_grid: list[float] | np.ndarray | None = None,
+    mode: str = "optimized",
+    compute_ci: bool = False,
+    candidates: list[StrategyParams] | None = None,
+    execution_cost_per_barrel: float = 0.05,
 ) -> list[dict]:
     """
-    Sweep a grid of staggered hedge ratios, simulate each, and score them.
+    Evaluate hedge candidates and return ranked results.
 
-    Improvement #2: Uses ProcessPoolExecutor for parallel evaluation.
-    Falls back to sequential execution if multiprocessing is unavailable
-    (some cloud environments restrict fork).
+    If candidates is provided:
+        Evaluates those StrategyParams directly.
 
-    Args:
-        forecast_obj: shared PriceForecast (generated ONCE, reused across all candidates)
-        exposure: ExposureBook
-        risk: RiskAppetite (weights + cvar_alpha + max_hedge)
-        forward_price: locked-in price for hedged volumes
-        hedge_ratio_grid: 1-D array of fractions to test; defaults to 11-point grid
-        n_workers: number of worker processes (default None = os.cpu_count())
+    If candidates is None:
+        Generates staggered candidates from hedge_ratio_grid.
 
     Returns:
-        list of dicts sorted by blended score ascending (best first)
+        list of dictionaries:
+            {
+                "hedge_ratio": float,
+                "strategy_type": str,
+                "params": StrategyParams,
+                "cost": CostDistribution,
+                "score": FactorScore,
+            }
     """
-    if hedge_ratio_grid is None:
-        hedge_ratio_grid = DEFAULT_HEDGE_GRID
 
-    grid = np.asarray(hedge_ratio_grid, dtype=float)
-    grid = grid[grid <= risk.max_hedge]
-    if len(grid) == 0:
-        raise ValueError(
-            f"No hedge ratios survive max_hedge={risk.max_hedge} constraint."
-        )
+    if not 0 <= risk.max_hedge <= 1:
+        raise ValueError("risk.max_hedge must be between 0 and 1")
 
-    # no-hedge baseline — computed once
+    # ---------------------------------------------------------
+    # 1. No-hedge baseline
+    # ---------------------------------------------------------
+
     no_hedge_params = StrategyParams(
         strategy_type=StrategyType.STAGGERED,
         base_fraction=0.0,
+        cap=risk.max_hedge,
     )
+
     no_hedge_cost = simulate_cost(
-        forecast_obj, exposure, no_hedge_params, forward_price,
-        cvar_alpha=risk.cvar_alpha, mode="optimized",
+        forecast_obj=forecast_obj,
+        exposure=exposure,
+        params=no_hedge_params,
+        forward_price=forward_price,
+        cvar_alpha=risk.cvar_alpha,
+        mode="optimized",
+        compute_ci=False,
     )
 
-    # Serialize to plain arrays for passing to workers
-    paths_arr = np.asarray(forecast_obj.paths)
-    volumes_arr = np.asarray(exposure.volumes)
-    worker_args = [
-        (ratio, paths_arr, volumes_arr, forward_price, risk.cvar_alpha, risk.max_hedge)
-        for ratio in grid
-    ]
+    # ---------------------------------------------------------
+    # 2. Generate candidates if not supplied
+    # ---------------------------------------------------------
 
-    results = []
-    parallel_used = False
+    if candidates is None:
+        if hedge_ratio_grid is None:
+            hedge_ratio_grid = DEFAULT_HEDGE_GRID
 
-    # Improvement #2: try parallel, fall back to sequential
-    try:
-        if n_workers is None:
-            n_workers = os.cpu_count()
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = list(executor.map(_evaluate_single_candidate, worker_args))
-        parallel_used = True
-        for ratio, params, cost in futures:
-            score = score_policy(cost, no_hedge_cost, params, risk)
-            results.append({"params": params, "cost": cost, "score": score})
-    except Exception as e:
-        if parallel_used:
-            raise
-        print(f"[scorer] Multiprocessing unavailable ({e}), falling back to sequential.")
-        for ratio in grid:
-            params = StrategyParams(
-                strategy_type=StrategyType.STAGGERED,
-                base_fraction=float(ratio),
-                cap=float(risk.max_hedge),
+        hedge_ratio_grid = np.asarray(hedge_ratio_grid, dtype=float)
+
+        if hedge_ratio_grid.ndim != 1:
+            raise ValueError("hedge_ratio_grid must be a 1D list or array")
+
+        if np.any((hedge_ratio_grid < 0) | (hedge_ratio_grid > 1)):
+            raise ValueError("hedge ratios must be between 0 and 1")
+
+        valid_ratios = [
+            float(ratio)
+            for ratio in hedge_ratio_grid
+            if ratio <= risk.max_hedge
+        ]
+
+        if not valid_ratios:
+            raise ValueError(
+                f"No hedge ratios remain after applying max_hedge={risk.max_hedge}"
             )
-            cost = simulate_cost(
-                forecast_obj, exposure, params, forward_price,
-                cvar_alpha=risk.cvar_alpha, mode="optimized",
-            )
-            score = score_policy(cost, no_hedge_cost, params, risk)
-            results.append({"params": params, "cost": cost, "score": score})
 
-    mode_str = f"parallel (n_workers={n_workers})" if parallel_used else "sequential"
-    print(f"[scorer] evaluate_candidates ran in {mode_str} mode.")
+        candidates = generate_staggered_candidates(
+            fractions=valid_ratios,
+            cap=risk.max_hedge,
+        )
 
-    results.sort(key=lambda r: r["score"].blended)
+    # ---------------------------------------------------------
+    # 3. Simulate + score candidates
+    # ---------------------------------------------------------
+
+    results: list[dict] = []
+
+    for params in candidates:
+        cost_dist = simulate_cost(
+            forecast_obj=forecast_obj,
+            exposure=exposure,
+            params=params,
+            forward_price=forward_price,
+            cvar_alpha=risk.cvar_alpha,
+            mode=mode,
+            compute_ci=compute_ci,
+        )
+
+        score = score_policy(
+            cost=cost_dist,
+            no_hedge_cost=no_hedge_cost,
+            params=params,
+            risk=risk,
+            exposure=exposure,
+            forecast_obj=forecast_obj,
+            execution_cost_per_barrel=execution_cost_per_barrel,
+        )
+
+        results.append(
+            {
+                "hedge_ratio": float(params.base_fraction),
+                "strategy_type": params.strategy_type.value,
+                "params": params,
+                "cost": cost_dist,
+                "score": score,
+            }
+        )
+
+    results.sort(key=lambda item: item["score"].blended)
+
     return results
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible helper
+# ---------------------------------------------------------------------------
+
+def find_best_staggered_hedge(
+    forecast_obj: PriceForecast,
+    exposure: ExposureBook,
+    forward_price,
+    risk: RiskAppetite,
+    hedge_ratios: list[float] | None = None,
+):
+    """
+    Backward-compatible helper.
+
+    Returns:
+        best, results
+
+    best:
+        dictionary for lowest-score policy
+
+    results:
+        all candidates sorted by score ascending
+    """
+
+    results = evaluate_candidates(
+        forecast_obj=forecast_obj,
+        exposure=exposure,
+        risk=risk,
+        forward_price=forward_price,
+        hedge_ratio_grid=hedge_ratios,
+        mode="optimized",
+        compute_ci=False,
+    )
+
+    best = results[0]
+
+    return best, results

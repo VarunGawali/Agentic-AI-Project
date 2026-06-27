@@ -1,162 +1,353 @@
 """
-Strategy library: generate HedgingPolicy hedge fractions from StrategyParams.
+Strategy library: generate hedge fractions from StrategyParams.
 
-BASELINE (Phase 1): staggered strategy with cap constraint.
-PHASE 3 additions:
-  - TRIGGER: hedge high_frac when price > MA * threshold, else base_frac.
-  - VOLATILITY: scale base_frac continuously by realised vol vs long-run vol.
-  - HYBRID: combine trigger and vol signals multiplicatively.
-  - DP_OPTIMAL: Bellman-optimal policy via backward induction over a discretised
-    (price_bin × vol_bin) state space; built offline by build_dp_table().
+Phase 1:
+    - STAGGERED hedge strategy
 
-CHANGES:
-  - apply_strategy() now accepts price_history prefix for MA computation on
-    path-dependent strategies; STAGGERED path stays fully vectorised.
-  - is_path_dependent() helper: True for TRIGGER / VOLATILITY / HYBRID / DP.
-  - build_dp_table(): backward induction, returns policy dict for DP_OPTIMAL.
-  - generate_batch_candidates() extended to HYBRID and DP_OPTIMAL types.
+Phase 3:
+    - TRIGGER strategy
+    - VOLATILITY strategy
+    - HYBRID strategy
+    - DP_OPTIMAL strategy using offline dynamic-programming table
+
+Notes:
+    - STAGGERED is path-independent and can be vectorized by simulator.
+    - TRIGGER / VOLATILITY / HYBRID / DP_OPTIMAL are path-dependent.
 """
 
 from __future__ import annotations
+
 import numpy as np
 
-from hedging_assistant.contracts import (
-    StrategyType, StrategyParams, HedgingPolicy, PriceForecast,
+from contracts import (
+    StrategyType,
+    StrategyParams,
+    HedgingPolicy,
+    PriceForecast,
 )
 
-# ── price-bin edges: log(price / MA), 5 buckets ──────────────────────────────
-_PRICE_BINS = np.array([-0.10, -0.03, 0.03, 0.10])   # 5 regions, 4 cut-points
-# ── vol-bin: realised_vol vs long_run_vol; split at 1.2× ─────────────────────
-_VOL_SPLIT  = 1.2
+
+# ---------------------------------------------------------------------------
+# DP state-space constants
+# ---------------------------------------------------------------------------
+
+_PRICE_BINS = np.array([-0.10, -0.03, 0.03, 0.10])
+_VOL_SPLIT = 1.2
+
 N_PRICE_BINS = 5
-N_VOL_BINS   = 2
-N_STATES     = N_PRICE_BINS * N_VOL_BINS   # 10
+N_VOL_BINS = 2
+N_STATES = N_PRICE_BINS * N_VOL_BINS
 
 
-def _price_bin(price: float, ma: float) -> int:
-    ratio = np.log(price / ma) if ma > 0 else 0.0
-    return int(np.searchsorted(_PRICE_BINS, ratio))   # 0..4
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
+def _price_bin(
+    price: float,
+    ma: float,
+) -> int:
+    """
+    Convert price relative to moving average into one of 5 bins.
+    """
+
+    if ma <= 0 or not np.isfinite(ma):
+        ratio = 0.0
+    else:
+        ratio = np.log(price / ma)
+
+    return int(np.searchsorted(_PRICE_BINS, ratio))
 
 
-def _vol_bin(realised_vol: float, long_run_vol: float) -> int:
+def _vol_bin(
+    realised_vol: float,
+    long_run_vol: float,
+) -> int:
+    """
+    Convert realised volatility into low-vol/high-vol bin.
+    """
+
+    if long_run_vol <= 0 or not np.isfinite(long_run_vol):
+        return 0
+
     return 1 if (realised_vol / long_run_vol) >= _VOL_SPLIT else 0
 
 
-def _state_idx(pb: int, vb: int) -> int:
-    return pb * N_VOL_BINS + vb
+def _state_idx(
+    price_bin: int,
+    vol_bin: int,
+) -> int:
+    """
+    Convert price-bin and vol-bin to flattened state index.
+    """
+
+    return price_bin * N_VOL_BINS + vol_bin
 
 
-def _compute_vol(prices: np.ndarray) -> float:
-    """Annualised vol from log-returns of the supplied price window."""
+def _compute_vol(
+    prices: np.ndarray,
+) -> float:
+    """
+    Compute annualized volatility from log returns of supplied price window.
+
+    Note:
+        Since the window can be monthly/daily depending on context, this is a
+        local realized-vol proxy, not a fully calendar-annualized measure.
+    """
+
+    prices = np.asarray(prices, dtype=float)
+
     if len(prices) < 2:
         return 0.0
-    lr = np.diff(np.log(prices))
-    return float(lr.std(ddof=1)) * np.sqrt(len(lr))
+
+    prices = prices[prices > 0]
+
+    if len(prices) < 2:
+        return 0.0
+
+    log_returns = np.diff(np.log(prices))
+
+    if len(log_returns) < 2:
+        return 0.0
+
+    vol = float(log_returns.std(ddof=1)) * np.sqrt(len(log_returns))
+
+    if not np.isfinite(vol):
+        return 0.0
+
+    return vol
 
 
 def is_path_dependent(params: StrategyParams) -> bool:
-    return params.strategy_type in (
-        StrategyType.TRIGGER, StrategyType.VOLATILITY,
-        StrategyType.HYBRID,  StrategyType.DP_OPTIMAL,
-    )
+    return params.strategy_type in {
+        StrategyType.TRIGGER,
+        StrategyType.VOLATILITY,
+        StrategyType.HYBRID,
+        StrategyType.DP_OPTIMAL,
+    }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core: apply a strategy to one path (or static for STAGGERED)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_params(
+    params: StrategyParams,
+) -> None:
+    """
+    Validate common strategy parameters.
+    """
+
+    if not 0 <= params.base_fraction <= 1:
+        raise ValueError("base_fraction must be between 0 and 1")
+
+    if not 0 <= params.cap <= 1:
+        raise ValueError("cap must be between 0 and 1")
+
+    if hasattr(params, "trigger_fraction"):
+        if not 0 <= params.trigger_fraction <= 1:
+            raise ValueError("trigger_fraction must be between 0 and 1")
+
+    if hasattr(params, "trigger_threshold"):
+        if params.trigger_threshold <= 0:
+            raise ValueError("trigger_threshold must be positive")
+
+    if hasattr(params, "ma_window"):
+        if params.ma_window < 2:
+            raise ValueError("ma_window must be at least 2")
+
+
+def _prepare_price_path(
+    price_path: np.ndarray,
+) -> np.ndarray:
+    """
+    Convert and validate one simulated price path.
+    """
+
+    price_path = np.asarray(price_path, dtype=float)
+
+    if price_path.ndim != 1:
+        raise ValueError("price_path must be a 1D array")
+
+    if len(price_path) == 0:
+        raise ValueError("price_path cannot be empty")
+
+    if np.any(price_path <= 0):
+        raise ValueError("price_path must contain only positive prices")
+
+    return price_path
+
+
+# ---------------------------------------------------------------------------
+# Core strategy application
+# ---------------------------------------------------------------------------
 
 def apply_strategy(
     params: StrategyParams,
     price_path: np.ndarray,
     price_history: np.ndarray | None = None,
     long_run_vol: float | None = None,
+    history_vol: float | None = None,
 ) -> np.ndarray:
     """
-    Compute the hedge fraction schedule for one price path.
+    Compute hedge fraction schedule for one simulated price path.
 
-    Parameters
-    ----------
-    params        : strategy configuration
-    price_path    : shape (H,)  — future prices for one simulated path
-    price_history : shape (T,)  — historical prices preceding price_path;
-                    used to warm-start the moving average.  If None the MA
-                    is computed entirely from within price_path.
-    long_run_vol  : long-run annualised vol for vol-scaling reference;
-                    estimated from price_history if not supplied.
+    Parameters:
+        params:
+            Strategy configuration.
 
-    Returns
-    -------
-    fractions : shape (H,)  values in [0, cap]
+        price_path:
+            Future simulated price path, shape = (horizon,).
+
+        price_history:
+            Historical prices before price_path.
+            Used to warm-start moving average and volatility calculations.
+
+        long_run_vol:
+            Long-run volatility reference for VOLATILITY/HYBRID/DP strategies.
+
+        history_vol:
+            Backward-compatible alias from older code.
+            If long_run_vol is not provided, history_vol is used.
+
+    Returns:
+        Hedge fractions, shape = (horizon,), clipped to [0, cap].
     """
+
+    price_path = _prepare_price_path(price_path)
+    _validate_params(params)
+
     horizon = len(price_path)
-    if horizon == 0:
-        raise ValueError("price_path is empty.")
 
-    # ── STAGGERED: fully vectorised, no history needed ────────────────────────
+    if long_run_vol is None and history_vol is not None:
+        long_run_vol = history_vol
+
+    # -----------------------------------------------------------------------
+    # STAGGERED: path-independent, fully vectorizable
+    # -----------------------------------------------------------------------
+
     if params.strategy_type == StrategyType.STAGGERED:
-        return np.clip(np.full(horizon, params.base_fraction), 0.0, params.cap)
-
-    # ── Path-dependent strategies need history for warm MA / vol ─────────────
-    hist = np.asarray(price_history) if price_history is not None else np.array([])
-    full = np.concatenate([hist, price_path]) if len(hist) else price_path
-
-    # Long-run vol: estimate from history if not supplied
-    if long_run_vol is None or long_run_vol <= 0:
-        ref = hist if len(hist) >= 10 else full
-        long_run_vol = max(_compute_vol(ref), 1e-8)
-
-    ma_w = max(params.ma_window, 2)
-    fractions = np.empty(horizon)
-
-    for t in range(horizon):
-        # index into the concatenated series
-        idx = len(hist) + t
-        p_now = price_path[t]
-
-        # ── Moving-average for trigger / hybrid ──────────────────────────────
-        window_start = max(0, idx - ma_w + 1)
-        ma = float(full[window_start : idx + 1].mean())
-
-        # ── Realised vol over the same window ────────────────────────────────
-        rv_window = full[max(0, idx - ma_w) : idx + 1]
-        rv = _compute_vol(rv_window) if len(rv_window) >= 2 else long_run_vol
-        realised_vol = rv if np.isfinite(rv) and rv > 0 else long_run_vol
-
-        if params.strategy_type == StrategyType.TRIGGER:
-            frac = (
-                params.trigger_fraction
-                if (p_now / ma) >= params.trigger_threshold
-                else params.base_fraction
+        hedge_fraction = min(params.base_fraction, params.cap)
+        return np.full(horizon, hedge_fraction, dtype=float)
+    
+    if params.strategy_type == StrategyType.CVAR_LP:
+        if params.fixed_fractions is None:
+            raise ValueError(
+                "fixed_fractions is required for CVAR_LP strategy."
             )
 
+        fixed = np.asarray(params.fixed_fractions, dtype=float)
+
+        if len(fixed) != horizon:
+            raise ValueError(
+                f"CVAR_LP fixed_fractions length {len(fixed)} does not match "
+                f"forecast horizon {horizon}"
+            )
+
+        return np.clip(fixed, 0.0, params.cap)
+
+    # -----------------------------------------------------------------------
+    # Path-dependent strategies
+    # -----------------------------------------------------------------------
+
+    hist = (
+        np.asarray(price_history, dtype=float)
+        if price_history is not None
+        else np.array([], dtype=float)
+    )
+
+    hist = hist[hist > 0]
+
+    if len(hist):
+        full = np.concatenate([hist, price_path])
+    else:
+        full = price_path
+
+    if long_run_vol is None or long_run_vol <= 0 or not np.isfinite(long_run_vol):
+        reference_prices = hist if len(hist) >= 10 else full
+        long_run_vol = max(_compute_vol(reference_prices), 1e-8)
+
+    ma_window = max(int(getattr(params, "ma_window", 5)), 2)
+
+    fractions = np.empty(horizon, dtype=float)
+
+    for t in range(horizon):
+        idx = len(hist) + t
+        p_now = float(price_path[t])
+
+        window_start = max(0, idx - ma_window + 1)
+        ma = float(full[window_start: idx + 1].mean())
+
+        rv_window = full[max(0, idx - ma_window): idx + 1]
+        realised_vol = _compute_vol(rv_window)
+
+        if not np.isfinite(realised_vol) or realised_vol <= 0:
+            realised_vol = long_run_vol
+
+        # -------------------------------------------------------------------
+        # TRIGGER
+        # -------------------------------------------------------------------
+
+        if params.strategy_type == StrategyType.TRIGGER:
+            if (p_now / ma) >= params.trigger_threshold:
+                frac = params.trigger_fraction
+            else:
+                frac = params.base_fraction
+
+        # -------------------------------------------------------------------
+        # VOLATILITY
+        # -------------------------------------------------------------------
+
         elif params.strategy_type == StrategyType.VOLATILITY:
-            # Continuous scaling: frac = base * (1 + k * (rv/lrv - 1))
-            scale = 1.0 + params.vol_scale_k * (realised_vol / long_run_vol - 1.0)
-            frac  = params.base_fraction * max(scale, 0.0)
+            scale = 1.0 + params.vol_scale_k * (
+                realised_vol / long_run_vol - 1.0
+            )
+
+            frac = params.base_fraction * max(scale, 0.0)
+
+        # -------------------------------------------------------------------
+        # HYBRID
+        # -------------------------------------------------------------------
 
         elif params.strategy_type == StrategyType.HYBRID:
-            # Trigger multiplier: ratio of trigger_fraction to base_fraction
-            # when trigger fires; 1.0 otherwise.
             if params.base_fraction > 0:
-                trig_mult = (
-                    params.trigger_fraction / params.base_fraction
-                    if (p_now / ma) >= params.trigger_threshold
-                    else 1.0
-                )
+                if (p_now / ma) >= params.trigger_threshold:
+                    trigger_multiplier = (
+                        params.trigger_fraction / params.base_fraction
+                    )
+                else:
+                    trigger_multiplier = 1.0
             else:
-                trig_mult = 1.0
-            vol_scale = 1.0 + params.vol_scale_k * (realised_vol / long_run_vol - 1.0)
-            frac = params.base_fraction * max(trig_mult * vol_scale, 0.0)
+                trigger_multiplier = 1.0
+
+            vol_scale = 1.0 + params.vol_scale_k * (
+                realised_vol / long_run_vol - 1.0
+            )
+
+            frac = params.base_fraction * max(
+                trigger_multiplier * vol_scale,
+                0.0,
+            )
+
+        # -------------------------------------------------------------------
+        # DP_OPTIMAL
+        # -------------------------------------------------------------------
 
         elif params.strategy_type == StrategyType.DP_OPTIMAL:
             if params.dp_table is None:
                 raise ValueError(
-                    "dp_table is None — call build_dp_table() first "
-                    "and attach the result to StrategyParams.dp_table."
+                    "dp_table is None. Call build_dp_table() first and attach "
+                    "the result to StrategyParams.dp_table."
                 )
+
             pb = _price_bin(p_now, ma)
             vb = _vol_bin(realised_vol, long_run_vol)
-            frac = params.dp_table.get((t, pb, vb), params.base_fraction)
+
+            frac = params.dp_table.get(
+                (t, pb, vb),
+                params.base_fraction,
+            )
 
         else:
             raise ValueError(f"Unknown strategy type: {params.strategy_type}")
@@ -166,209 +357,402 @@ def apply_strategy(
     return fractions
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DP: backward induction over (price_bin × vol_bin) state space
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Forward price helper for DP
+# ---------------------------------------------------------------------------
+
+def _resolve_forward_curve(
+    forward_price,
+    horizon: int,
+) -> np.ndarray:
+    """
+    Resolve scalar/list/ForwardCurve-like object into forward curve array.
+
+    Supported:
+        - scalar float
+        - list/np.ndarray shape (horizon,)
+        - object with .prices
+    """
+
+    if np.isscalar(forward_price):
+        if float(forward_price) <= 0:
+            raise ValueError("forward_price must be positive")
+
+        return np.full(horizon, float(forward_price), dtype=float)
+
+    if hasattr(forward_price, "prices"):
+        fwd = np.asarray(forward_price.prices, dtype=float)
+    else:
+        fwd = np.asarray(forward_price, dtype=float)
+
+    if fwd.ndim != 1:
+        raise ValueError("forward curve must be 1D")
+
+    if len(fwd) != horizon:
+        raise ValueError(
+            f"forward curve length {len(fwd)} does not match horizon {horizon}"
+        )
+
+    if np.any(fwd <= 0):
+        raise ValueError("forward curve prices must be positive")
+
+    return fwd
+
+
+# ---------------------------------------------------------------------------
+# DP table builder
+# ---------------------------------------------------------------------------
 
 def build_dp_table(
     forecast_obj: PriceForecast,
-    exposure,            # ExposureBook
-    forward_price,       # float or ForwardCurve
-    max_hedge:    float = 1.0,
-    n_actions:    int   = 11,
-    cost_weight:  float = 1.0,
-    cvar_weight:  float = 1.0,
-    cvar_alpha:   float = 0.95,
+    exposure,
+    forward_price,
+    max_hedge: float = 1.0,
+    n_actions: int = 11,
+    cost_weight: float = 1.0,
+    cvar_weight: float = 1.0,
+    cvar_alpha: float = 0.95,
     price_history: np.ndarray | None = None,
-    long_run_vol:  float | None = None,
+    long_run_vol: float | None = None,
 ) -> dict:
     """
-    Bellman-optimal hedge policy via backward induction.
+    Build Bellman-style DP hedge policy over a discretized state space.
 
-    State space: (t, price_bin, vol_bin) — 10 states per period.
-    Actions:     n_actions discrete fractions in [0, max_hedge].
-    Objective:   minimise cost_weight * E[cost] + cvar_weight * CVaR
-                 over remaining periods, using empirical path transitions.
+    State:
+        (period t, price_bin, vol_bin)
 
-    Algorithm
-    ---------
-    1. Bin each GBM path into states at each period t.
-    2. For t = H-1 down to 0:
-         for each state s:
-           for each action f:
-             compute immediate cost(t, f, paths in state s)
-             + E[V*(t+1, s') | s, f]   (expectation over GBM transitions)
-           π*(t, s) = argmin over f
-    3. Return {(t, price_bin, vol_bin): optimal_fraction}.
+    Action:
+        Hedge fraction from discrete grid in [0, max_hedge]
 
-    The policy is then used path-by-path in apply_strategy(DP_OPTIMAL).
+    Objective:
+        cost_weight * expected immediate cost
+        + cvar_weight * immediate CVaR
+        + expected next-state value
 
-    Parameters
-    ----------
-    forecast_obj   : PriceForecast with paths (N, H)
-    exposure       : ExposureBook with volumes (H,)
-    forward_price  : float or ForwardCurve
-    max_hedge      : hard cap on hedge fraction
-    n_actions      : grid resolution over [0, max_hedge]
-    cost_weight    : weight on expected cost in objective
-    cvar_weight    : weight on CVaR in objective
-    cvar_alpha     : CVaR tail level
-    price_history  : shape (T,) historical prices for MA warm-start
-    long_run_vol   : long-run vol reference; estimated if None
-
-    Returns
-    -------
-    dict: {(t: int, price_bin: int, vol_bin: int): hedge_fraction: float}
+    Returns:
+        dict mapping:
+            (t, price_bin, vol_bin) -> optimal hedge fraction
     """
-    from hedging_assistant.contracts import ForwardCurve
 
-    paths   = np.asarray(forecast_obj.paths, dtype=float)   # (N, H)
-    volumes = np.asarray(exposure.volumes,   dtype=float)   # (H,)
-    N, H    = paths.shape
+    paths = np.asarray(forecast_obj.paths, dtype=float)
+    volumes = np.asarray(exposure.volumes, dtype=float)
 
-    if isinstance(forward_price, ForwardCurve):
-        fwd = np.asarray(forward_price.prices, dtype=float)
-    else:
-        fwd = np.full(H, float(forward_price))
+    if paths.ndim != 2:
+        raise ValueError("forecast_obj.paths must be 2D")
 
-    actions = np.linspace(0.0, max_hedge, n_actions)        # (A,)
-    A       = len(actions)
+    n_paths, horizon = paths.shape
 
-    # ── Estimate long-run vol from history or all paths ───────────────────────
-    hist = np.asarray(price_history) if price_history is not None else np.array([])
-    if long_run_vol is None or long_run_vol <= 0:
-        ref = hist if len(hist) >= 10 else paths[:, 0]
-        long_run_vol = max(_compute_vol(ref if len(ref.shape) == 1 else ref.flatten()), 1e-8)
+    if len(volumes) != horizon:
+        raise ValueError(
+            f"exposure length {len(volumes)} does not match horizon {horizon}"
+        )
 
-    ma_window = 5   # fixed for DP; can expose as param later
+    if not 0 < max_hedge <= 1:
+        raise ValueError("max_hedge must be in (0, 1]")
 
-    # ── Bin every path at every period ───────────────────────────────────────
-    # state_matrix[n, t] = state index (0..N_STATES-1)
-    state_matrix = np.zeros((N, H), dtype=int)
-    for n in range(N):
-        for t in range(H):
-            idx     = len(hist) + t
-            full_t  = np.concatenate([hist, paths[n, :t+1]])
-            w_start = max(0, len(full_t) - ma_window)
-            ma      = float(full_t[w_start:].mean())
-            rv_win  = full_t[max(0, len(full_t)-ma_window):]
-            rv      = max(_compute_vol(rv_win), 1e-8)
-            pb      = _price_bin(paths[n, t], ma)
-            vb      = _vol_bin(rv, long_run_vol)
+    if n_actions < 2:
+        raise ValueError("n_actions must be at least 2")
+
+    if not 0 < cvar_alpha < 1:
+        raise ValueError("cvar_alpha must be between 0 and 1")
+
+    fwd = _resolve_forward_curve(forward_price, horizon)
+
+    actions = np.linspace(0.0, max_hedge, n_actions)
+    n_actions_actual = len(actions)
+
+    hist = (
+        np.asarray(price_history, dtype=float)
+        if price_history is not None
+        else np.array([], dtype=float)
+    )
+
+    hist = hist[hist > 0]
+
+    if long_run_vol is None or long_run_vol <= 0 or not np.isfinite(long_run_vol):
+        reference = hist if len(hist) >= 10 else paths.flatten()
+        long_run_vol = max(_compute_vol(reference), 1e-8)
+
+    ma_window = 5
+
+    state_matrix = np.zeros((n_paths, horizon), dtype=int)
+
+    for n in range(n_paths):
+        for t in range(horizon):
+            if len(hist):
+                full_t = np.concatenate([hist, paths[n, : t + 1]])
+            else:
+                full_t = paths[n, : t + 1]
+
+            ma = float(full_t[max(0, len(full_t) - ma_window):].mean())
+
+            rv_window = full_t[max(0, len(full_t) - ma_window):]
+            realised_vol = max(_compute_vol(rv_window), 1e-8)
+
+            pb = _price_bin(paths[n, t], ma)
+            vb = _vol_bin(realised_vol, long_run_vol)
+
             state_matrix[n, t] = _state_idx(pb, vb)
 
-    # ── Immediate cost for each path n, period t, action f ───────────────────
-    # cost(n, t, f) = f * vol_t * fwd_t  +  (1-f) * vol_t * path[n,t]
-    #              = vol_t * (f * fwd_t + (1-f) * path[n,t])
-    # shape: (N, H, A)
-    vol_mat  = volumes[None, :, None]            # (1, H, 1)
-    fwd_mat  = fwd[None, :, None]                # (1, H, 1)
-    path_mat = paths[:, :, None]                 # (N, H, 1)
-    action_mat = actions[None, None, :]          # (1, 1, A)
+    vol_mat = volumes[None, :, None]
+    fwd_mat = fwd[None, :, None]
+    path_mat = paths[:, :, None]
+    action_mat = actions[None, None, :]
 
-    period_costs = vol_mat * (action_mat * fwd_mat + (1.0 - action_mat) * path_mat)
-    # shape: (N, H, A)
+    period_costs = vol_mat * (
+        action_mat * fwd_mat
+        + (1.0 - action_mat) * path_mat
+    )
 
-    # ── Backward induction ────────────────────────────────────────────────────
-    # V[s, a] = expected future value from state s taking action a at period t
-    # policy[t, s] = optimal action index
+    value_next = np.zeros(N_STATES, dtype=float)
+    policy: dict[tuple[int, int, int], float] = {}
 
-    # Terminal value: V*(H, ·) = 0
-    V_next = np.zeros(N_STATES)   # value at t+1, indexed by state
-
-    policy = {}   # {(t, pb, vb): fraction}
-
-    for t in reversed(range(H)):
-        V_curr = np.full(N_STATES, np.inf)
+    for t in reversed(range(horizon)):
+        value_curr = np.full(N_STATES, np.inf, dtype=float)
         action_opt = np.zeros(N_STATES, dtype=int)
 
-        for s in range(N_STATES):
-            # paths currently in state s at period t
-            mask = state_matrix[:, t] == s
-            if mask.sum() == 0:
-                # no paths in this state — use nearest populated state heuristic
-                V_curr[s] = 0.0
-                action_opt[s] = n_actions // 2
+        for state in range(N_STATES):
+            mask = state_matrix[:, t] == state
+            n_state = int(mask.sum())
+
+            if n_state == 0:
+                value_curr[state] = 0.0
+                action_opt[state] = n_actions_actual // 2
                 continue
 
-            # immediate cost for each action: mean over paths in this state
-            imm = period_costs[mask, t, :]           # (n_s, A)
-            imm_mean = imm.mean(axis=0)              # (A,)
+            immediate = period_costs[mask, t, :]
+            immediate_mean = immediate.mean(axis=0)
 
-            # CVaR over paths in this state for each action
-            # (only meaningful when n_s is large enough; else use mean)
-            if mask.sum() >= 20:
-                thr = np.percentile(imm, cvar_alpha * 100, axis=0)   # (A,)
-                # CVaR: mean of values >= thr per action
-                cvar_arr = np.array([
-                    float(imm[imm[:, a] >= thr[a], a].mean()) if (imm[:, a] >= thr[a]).any() else thr[a]
-                    for a in range(A)
-                ])
+            if n_state >= 20:
+                thresholds = np.percentile(
+                    immediate,
+                    cvar_alpha * 100,
+                    axis=0,
+                )
+
+                cvar_values = np.array(
+                    [
+                        float(
+                            immediate[immediate[:, a] >= thresholds[a], a].mean()
+                        )
+                        if np.any(immediate[:, a] >= thresholds[a])
+                        else float(thresholds[a])
+                        for a in range(n_actions_actual)
+                    ],
+                    dtype=float,
+                )
             else:
-                cvar_arr = imm_mean
+                cvar_values = immediate_mean
 
-            # expected future value: E[V*(t+1, s') | s at t]
-            if t < H - 1:
-                next_states = state_matrix[mask, t + 1]     # (n_s,)
-                ev_next = V_next[next_states].mean()         # scalar
+            if t < horizon - 1:
+                next_states = state_matrix[mask, t + 1]
+                expected_next_value = float(value_next[next_states].mean())
             else:
-                ev_next = 0.0
+                expected_next_value = 0.0
 
-            # total objective per action
-            obj = cost_weight * imm_mean + cvar_weight * cvar_arr + ev_next
-            best_a = int(np.argmin(obj))
-            action_opt[s] = best_a
-            V_curr[s] = float(obj[best_a])
+            objective = (
+                cost_weight * immediate_mean
+                + cvar_weight * cvar_values
+                + expected_next_value
+            )
 
-        # store policy for this period
-        for s in range(N_STATES):
-            pb = s // N_VOL_BINS
-            vb = s %  N_VOL_BINS
-            policy[(t, pb, vb)] = float(actions[action_opt[s]])
+            best_action = int(np.argmin(objective))
+            action_opt[state] = best_action
+            value_curr[state] = float(objective[best_action])
 
-        V_next = V_curr
+        for state in range(N_STATES):
+            pb = state // N_VOL_BINS
+            vb = state % N_VOL_BINS
+            policy[(t, pb, vb)] = float(actions[action_opt[state]])
+
+        value_next = value_curr
 
     print(
-        f"[strategy_library] DP table built: {H} periods × {N_STATES} states. "
-        f"long_run_vol={long_run_vol:.3f}"
+        f"[strategy_library] DP table built: "
+        f"{horizon} periods x {N_STATES} states. "
+        f"long_run_vol={long_run_vol:.4f}"
     )
+
     return policy
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Policy builder (representative path — median)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Policy builder
+# ---------------------------------------------------------------------------
 
 def build_policy(
     params: StrategyParams,
     forecast_obj: PriceForecast,
     price_history: np.ndarray | None = None,
 ) -> HedgingPolicy:
-    """Build a representative HedgingPolicy using the median forecast path."""
-    median_path = np.percentile(forecast_obj.paths, 50, axis=0)
-    fractions   = apply_strategy(params, median_path, price_history=price_history)
-    desc = f"{params.base_fraction:.0%} {params.strategy_type.value} (cap={params.cap:.0%})"
-    return HedgingPolicy(params=params, hedge_fractions=fractions, description=desc)
+    """
+    Build a representative HedgingPolicy using the median forecast path.
+    """
+
+    paths = np.asarray(forecast_obj.paths, dtype=float)
+
+    if paths.ndim != 2:
+        raise ValueError("forecast_obj.paths must be 2D: (n_paths, horizon)")
+
+    if paths.shape[1] == 0:
+        raise ValueError("forecast horizon cannot be zero")
+
+    median_path = np.percentile(paths, 50, axis=0)
+
+    hedge_fractions = apply_strategy(
+        params=params,
+        price_path=median_path,
+        price_history=price_history,
+    )
+
+    if params.strategy_type == StrategyType.CVAR_LP:
+        description = f"CVaR-LP optimized hedge schedule with cap {params.cap:.0%}"
+    else:
+        description = (
+            f"{params.base_fraction:.0%} {params.strategy_type.value} hedge "
+            f"with cap {params.cap:.0%}"
+        )
+
+    return HedgingPolicy(
+        params=params,
+        hedge_fractions=hedge_fractions,
+        description=description,
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Candidate generators
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def generate_staggered_candidates(
+    fractions: list[float] | None = None,
     max_hedge: float = 1.0,
-    n_steps: int = 11,
+    n_steps: int = 5,
     cap: float = 1.0,
-) -> list[StrategyParams]:
-    if not (0 < max_hedge <= 1.0):
-        raise ValueError(f"max_hedge must be in (0, 1]; got {max_hedge}")
+) -> list:
+    """
+    Generate staggered hedge candidates.
+
+    Supports:
+        explicit fractions=[...]
+        or grid max_hedge/n_steps.
+    """
+
+    if not 0 <= max_hedge <= 1:
+        raise ValueError("max_hedge must be between 0 and 1")
+
+    if not 0 <= cap <= 1:
+        raise ValueError("cap must be between 0 and 1")
+
     if n_steps < 2:
-        raise ValueError(f"n_steps must be >= 2; got {n_steps}")
-    return [
-        StrategyParams(strategy_type=StrategyType.STAGGERED,
-                       base_fraction=float(f), cap=float(cap))
-        for f in np.linspace(0.0, max_hedge, n_steps)
-    ]
+        raise ValueError("n_steps must be at least 2")
+
+    effective_max = min(max_hedge, cap)
+
+    if fractions is None:
+        fractions_array = np.linspace(0.0, effective_max, n_steps)
+    else:
+        fractions_array = np.asarray(fractions, dtype=float)
+
+    candidates: list[StrategyParams] = []
+    seen: set[float] = set()
+
+    for frac in fractions_array:
+        if not 0 <= frac <= 1:
+            raise ValueError("all hedge fractions must be between 0 and 1")
+
+        effective_frac = min(float(frac), effective_max)
+        rounded_frac = round(effective_frac, 10)
+
+        if rounded_frac in seen:
+            continue
+
+        seen.add(rounded_frac)
+
+        candidates.append(
+            StrategyParams(
+                strategy_type=StrategyType.STAGGERED,
+                base_fraction=effective_frac,
+                cap=cap,
+            )
+        )
+
+    return candidates
+
+
+def generate_trigger_candidates(
+    max_hedge: float = 1.0,
+    base_fractions: list[float] | None = None,
+    trigger_thresholds: list[float] | None = None,
+    trigger_multipliers: list[float] | None = None,
+    ma_window: int = 5,
+    cap: float = 1.0,
+) -> list:
+    """
+    Generate trigger-based candidates.
+    """
+
+    base_fractions = base_fractions or [0.25, 0.50, 0.75]
+    trigger_thresholds = trigger_thresholds or [1.00, 1.05, 1.10]
+    trigger_multipliers = trigger_multipliers or [1.25, 1.50]
+
+    candidates: list[StrategyParams] = []
+
+    effective_cap = min(max_hedge, cap)
+
+    for base_fraction in base_fractions:
+        for threshold in trigger_thresholds:
+            for multiplier in trigger_multipliers:
+                trigger_fraction = min(
+                    float(base_fraction) * float(multiplier),
+                    effective_cap,
+                )
+
+                candidates.append(
+                    StrategyParams(
+                        strategy_type=StrategyType.TRIGGER,
+                        base_fraction=min(float(base_fraction), effective_cap),
+                        trigger_fraction=trigger_fraction,
+                        trigger_threshold=float(threshold),
+                        ma_window=ma_window,
+                        cap=effective_cap,
+                    )
+                )
+
+    return candidates
+
+
+def generate_volatility_candidates(
+    max_hedge: float = 1.0,
+    base_fractions: list[float] | None = None,
+    vol_scale_ks: list[float] | None = None,
+    ma_window: int = 5,
+    cap: float = 1.0,
+) -> list:
+    """
+    Generate volatility-scaling candidates.
+    """
+
+    base_fractions = base_fractions or [0.25, 0.50, 0.75]
+    vol_scale_ks = vol_scale_ks or [0.5, 1.0, 1.5]
+
+    effective_cap = min(max_hedge, cap)
+
+    candidates: list[StrategyParams] = []
+
+    for base_fraction in base_fractions:
+        for k in vol_scale_ks:
+            candidates.append(
+                StrategyParams(
+                    strategy_type=StrategyType.VOLATILITY,
+                    base_fraction=min(float(base_fraction), effective_cap),
+                    vol_scale_k=float(k),
+                    ma_window=ma_window,
+                    cap=effective_cap,
+                )
+            )
+
+    return candidates
 
 
 def generate_hybrid_candidates(
@@ -376,43 +760,101 @@ def generate_hybrid_candidates(
     base_fractions: list[float] | None = None,
     trigger_thresholds: list[float] | None = None,
     vol_scale_ks: list[float] | None = None,
+    ma_window: int = 5,
     cap: float = 1.0,
-) -> list[StrategyParams]:
+) -> list:
     """
-    Grid of HYBRID candidates over (base_fraction, trigger_threshold, vol_scale_k).
-    Defaults give a compact 3×2×2 = 12-candidate grid.
+    Generate HYBRID candidates over:
+        base_fraction
+        trigger_threshold
+        vol_scale_k
     """
-    bfs  = base_fractions       or [0.3, 0.6, 0.9]
-    thrs = trigger_thresholds   or [1.0, 1.05]
-    ks   = vol_scale_ks         or [0.5, 1.5]
-    return [
-        StrategyParams(
-            strategy_type=StrategyType.HYBRID,
-            base_fraction=float(bf),
-            trigger_fraction=min(float(bf) * 1.5, max_hedge),
-            trigger_threshold=float(thr),
-            vol_scale_k=float(k),
-            cap=float(cap),
-        )
-        for bf in bfs for thr in thrs for k in ks
-    ]
+
+    base_fractions = base_fractions or [0.30, 0.60, 0.90]
+    trigger_thresholds = trigger_thresholds or [1.00, 1.05]
+    vol_scale_ks = vol_scale_ks or [0.50, 1.50]
+
+    effective_cap = min(max_hedge, cap)
+
+    candidates: list[StrategyParams] = []
+
+    for base_fraction in base_fractions:
+        for threshold in trigger_thresholds:
+            for k in vol_scale_ks:
+                base = min(float(base_fraction), effective_cap)
+                trigger_fraction = min(base * 1.5, effective_cap)
+
+                candidates.append(
+                    StrategyParams(
+                        strategy_type=StrategyType.HYBRID,
+                        base_fraction=base,
+                        trigger_fraction=trigger_fraction,
+                        trigger_threshold=float(threshold),
+                        vol_scale_k=float(k),
+                        ma_window=ma_window,
+                        cap=effective_cap,
+                    )
+                )
+
+    return candidates
 
 
 def generate_batch_candidates(
     strategy_types: list[StrategyType] | None = None,
     max_hedge: float = 1.0,
-    n_steps: int = 11,
+    n_steps: int = 5,
     cap: float = 1.0,
-) -> list[StrategyParams]:
-    """Generate candidates across multiple strategy types."""
+) -> list:
+    """
+    Generate candidates across multiple strategy types.
+    """
+
     if strategy_types is None:
         strategy_types = [StrategyType.STAGGERED]
+
     all_candidates: list[StrategyParams] = []
-    for stype in strategy_types:
-        if stype == StrategyType.STAGGERED:
-            all_candidates.extend(generate_staggered_candidates(max_hedge, n_steps, cap))
-        elif stype == StrategyType.HYBRID:
-            all_candidates.extend(generate_hybrid_candidates(max_hedge, cap=cap))
+
+    for strategy_type in strategy_types:
+        if strategy_type == StrategyType.STAGGERED:
+            all_candidates.extend(
+                generate_staggered_candidates(
+                    max_hedge=max_hedge,
+                    n_steps=n_steps,
+                    cap=cap,
+                )
+            )
+
+        elif strategy_type == StrategyType.TRIGGER:
+            all_candidates.extend(
+                generate_trigger_candidates(
+                    max_hedge=max_hedge,
+                    cap=cap,
+                )
+            )
+
+        elif strategy_type == StrategyType.VOLATILITY:
+            all_candidates.extend(
+                generate_volatility_candidates(
+                    max_hedge=max_hedge,
+                    cap=cap,
+                )
+            )
+
+        elif strategy_type == StrategyType.HYBRID:
+            all_candidates.extend(
+                generate_hybrid_candidates(
+                    max_hedge=max_hedge,
+                    cap=cap,
+                )
+            )
+
+        elif strategy_type == StrategyType.DP_OPTIMAL:
+            raise NotImplementedError(
+                "DP_OPTIMAL candidates require a precomputed dp_table. "
+                "Build with build_dp_table() and create StrategyParams manually."
+            )
+
         else:
-            raise NotImplementedError(f"Batch generation for {stype} not yet wired.")
+            raise ValueError(f"Unknown strategy type: {strategy_type}")
+
     return all_candidates

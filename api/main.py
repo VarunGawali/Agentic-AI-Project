@@ -2,88 +2,329 @@
 FastAPI backend for the Hedging Assistant dashboard.
 
 Endpoints:
-  POST /recommend   — run the full agent pipeline, return recommendation JSON
-  POST /stress-test — run deterministic scenario paths, return per-scenario costs
-  GET  /health      — liveness probe
+    GET  /health
+    POST /recommend
+    POST /stress-test
+
+Current integration:
+    Uses the LangGraph workflow:
+        assess -> forecast -> explore -> arbitrate -> explain
+
+Phase 3:
+    - Supports XGB-GARCH-t as the default forecaster
+    - Supports 4-factor scoring controls:
+        expected cost
+        CVaR
+        opportunity cost
+        execution risk
+    - Returns richer candidate trace for dashboard/governance
 """
 
 from __future__ import annotations
+
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from typing import Any
 
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from hedging_assistant.data.loader import load_price_history, make_exposure_book
-from hedging_assistant.contracts import (
-    RiskAppetite, RunConfig, ForwardCurve,
-    StrategyParams, StrategyType,
-)
-from hedging_assistant.agent.orchestrator import HedgingAgent
-from hedging_assistant.engines.cost_simulator import simulate_cost
-from hedging_assistant.engines.forecaster import forecast as run_forecast
+# Allow imports from project root when running from api/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-app = FastAPI(title="Hedging Assistant API", version="1.0")
+from data.loader import load_price_history as load_price_history_df
+
+from contracts import (
+    PriceHistory,
+    PriceForecast,
+    ExposureBook,
+    RiskAppetite,
+    StrategyParams,
+    StrategyType,
+)
+
+from agent.langgraph_workflow import run_agent
+from engines.cost_simulator import simulate_cost
+
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Hedging Assistant API",
+    version="1.0",
+    description="Backend API for crude procurement and hedging decision assistant.",
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Request models
 # ---------------------------------------------------------------------------
 
 class RecommendRequest(BaseModel):
-    forward_price: float = Field(80.0, gt=0, description="USD/bbl locked-in price")
-    barrels_per_period: float = Field(100_000, gt=0)
-    horizon: int = Field(6, ge=1, le=24)
-    max_hedge: float = Field(1.0, ge=0, le=1)
-    cvar_weight: float = Field(1.0, ge=0, le=5)
-    model: str = Field("normal", pattern="^(normal|student-t|hmm|xgb-garch-t)$")
-    n_paths: int = Field(2000, ge=100, le=20000)
+    forward_price: float = Field(
+        95.0,
+        gt=0,
+        description="Forward/hedge price in USD per barrel.",
+    )
+    barrels_per_period: float = Field(
+        100_000,
+        gt=0,
+        description="Procurement volume per period.",
+    )
+    horizon: int = Field(
+        6,
+        ge=1,
+        le=24,
+        description="Forecast and procurement horizon.",
+    )
+    max_hedge: float = Field(
+        1.0,
+        ge=0,
+        le=1,
+        description="Maximum allowed hedge fraction.",
+    )
+    cvar_weight: float = Field(
+        1.0,
+        ge=0,
+        le=5,
+        description="Weight on CVaR downside risk.",
+    )
+    opportunity_weight: float = Field(
+        0.5,
+        ge=0,
+        le=5,
+        description="Weight on opportunity cost.",
+    )
+    execution_weight: float = Field(
+        0.25,
+        ge=0,
+        le=5,
+        description="Weight on execution risk.",
+    )
+    model: str = Field(
+        "xgb-garch-t",
+        pattern="^(xgb-garch-t|gbm|normal|student-t|hmm)$",
+        description="Forecast model.",
+    )
+    n_paths: int = Field(
+        4096,
+        ge=256,
+        le=20000,
+        description="Number of Monte Carlo paths.",
+    )
+    frequency: str = Field(
+        "M",
+        pattern="^(D|W|M)$",
+        description="Planning frequency: D, W, or M.",
+    )
+    calibration_window: int | None = Field(
+        1000,
+        ge=60,
+        le=5000,
+        description="Rows/observations used for calibration.",
+    )
+
 
 class StressRequest(BaseModel):
-    forward_price: float = Field(80.0, gt=0)
+    forward_price: float = Field(95.0, gt=0)
     barrels_per_period: float = Field(100_000, gt=0)
     horizon: int = Field(6, ge=1, le=24)
     hedge_fraction: float = Field(0.5, ge=0, le=1)
-    custom_shock_pct: float = Field(40.0, description="Custom shock % (positive=spike)")
+    custom_shock_pct: float = Field(
+        40.0,
+        description="Custom shock percentage. Positive means price spike.",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_scenario_paths(base_price: float, horizon: int, shock_pct: float,
-                           pattern: str = "linear") -> np.ndarray:
-    """Return shape (1, horizon) deterministic path for stress testing."""
-    path = np.full(horizon, base_price)
-    shock = base_price * shock_pct / 100
+def make_exposure_book(
+    barrels_per_period: float,
+    horizon: int,
+    period_label: str = "month",
+) -> ExposureBook:
+    """
+    Build simple flat exposure book.
+    """
+
+    return ExposureBook(
+        volumes=np.full(horizon, barrels_per_period, dtype=float),
+        period_label=period_label,
+    )
+
+
+def _build_fan_data(paths: np.ndarray) -> dict:
+    """
+    Build P10/P25/P50/P75/P90 forecast fan data.
+    """
+
+    return {
+        "p10": np.percentile(paths, 10, axis=0).tolist(),
+        "p25": np.percentile(paths, 25, axis=0).tolist(),
+        "p50": np.percentile(paths, 50, axis=0).tolist(),
+        "p75": np.percentile(paths, 75, axis=0).tolist(),
+        "p90": np.percentile(paths, 90, axis=0).tolist(),
+    }
+
+
+def _build_histogram(values: np.ndarray, bins: int = 40) -> dict:
+    """
+    Build histogram for dashboard plotting.
+    Values are expected in raw dollars.
+    Returned values are in millions.
+    """
+
+    counts, edges = np.histogram(values / 1e6, bins=bins)
+
+    return {
+        "counts": counts.tolist(),
+        "edges": edges.tolist(),
+    }
+
+
+def _safe_ci(value: Any) -> list[float] | None:
+    """
+    Convert optional confidence interval tuple to JSON-safe list in millions.
+    """
+
+    if value is None:
+        return None
+
+    return [
+        round(float(value[0]) / 1e6, 2),
+        round(float(value[1]) / 1e6, 2),
+    ]
+
+
+def _json_safe(value: Any) -> Any:
+    """
+    Convert common non-JSON-safe values into JSON-safe equivalents.
+
+    This prevents FastAPI serialization issues when assumptions contain
+    numpy arrays, dataclasses, paths, or large model objects.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, np.generic):
+        return value.item()
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, dict):
+        safe = {}
+
+        for key, item in value.items():
+            # Avoid shipping large objects like full forecast object to frontend.
+            if key in {"forecast_obj", "paths", "raw_paths"}:
+                continue
+
+            safe[str(key)] = _json_safe(item)
+
+        return safe
+
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+
+    # Dataclass-like fallback
+    if hasattr(value, "__dict__"):
+        return str(value)
+
+    return str(value)
+
+
+def _selected_hedge_pct(params: StrategyParams) -> float:
+    """
+    Return representative hedge percentage for dashboard summary.
+    """
+
+    if params.strategy_type == StrategyType.CVAR_LP and params.fixed_fractions is not None:
+        return float(np.mean(params.fixed_fractions) * 100.0)
+
+    return float(params.base_fraction * 100.0)
+
+
+def _build_scenario_path(
+    base_price: float,
+    horizon: int,
+    shock_pct: float,
+    pattern: str = "linear",
+) -> np.ndarray:
+    """
+    Return deterministic scenario path with shape (1, horizon).
+    """
+
+    shock = base_price * shock_pct / 100.0
+
     if pattern == "linear":
         path = base_price + np.linspace(0, shock, horizon)
+
     elif pattern == "spike_recover":
-        mid = horizon // 2
+        mid = max(1, horizon // 2)
+        path = np.empty(horizon, dtype=float)
         path[:mid] = base_price + np.linspace(0, shock, mid)
-        path[mid:] = path[mid-1] + np.linspace(0, -shock * 0.6, horizon - mid)
+        path[mid:] = path[mid - 1] + np.linspace(0, -shock * 0.6, horizon - mid)
+
     elif pattern == "crash":
-        path = base_price + np.linspace(0, shock, horizon)  # shock is negative
+        path = base_price + np.linspace(0, shock, horizon)
+
     elif pattern == "plateau":
-        path[:2] = base_price
-        path[2:] = base_price + shock
+        path = np.full(horizon, base_price, dtype=float)
+        if horizon > 2:
+            path[2:] = base_price + shock
+        else:
+            path[:] = base_price + shock
+
+    else:
+        raise ValueError(f"Unknown scenario pattern: {pattern}")
+
+    # Avoid invalid non-positive prices in severe crash scenarios.
+    path = np.maximum(path, 1.0)
+
     return path.reshape(1, -1)
 
 
 SCENARIOS = {
-    "2022 Spike":       {"shock_pct": +80,  "pattern": "linear"},
-    "2008 Crash":       {"shock_pct": -60,  "pattern": "crash"},
-    "COVID Collapse":   {"shock_pct": -75,  "pattern": "spike_recover"},
-    "Geopolitical":     {"shock_pct": +40,  "pattern": "plateau"},
+    "2022 Spike": {
+        "shock_pct": 80.0,
+        "pattern": "linear",
+    },
+    "2008 Crash": {
+        "shock_pct": -60.0,
+        "pattern": "crash",
+    },
+    "COVID Collapse": {
+        "shock_pct": -75.0,
+        "pattern": "crash",
+    },
+    "Geopolitical Spike": {
+        "shock_pct": 40.0,
+        "pattern": "plateau",
+    },
 }
 
 
@@ -92,135 +333,282 @@ SCENARIOS = {
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health() -> dict:
+    """
+    Liveness probe.
+    """
+
+    return {
+        "status": "ok",
+        "service": "hedging-assistant-api",
+    }
 
 
 @app.post("/recommend")
-def recommend(req: RecommendRequest):
-    history = load_price_history(symbol="WTI")
-
-    risk = RiskAppetite(
-        max_hedge=req.max_hedge,
-        w_cvar=req.cvar_weight,
-        cvar_alpha=0.95,
-    )
-    run_config = RunConfig(
-        n_paths=req.n_paths,
-        seed=42,
-        frequency="M",
-        distribution="student-t" if req.model == "student-t" else "normal",
-        use_regime=(req.model == "hmm"),
-        model="xgb-garch-t" if req.model == "xgb-garch-t" else "gbm",
-    )
-
-    agent = HedgingAgent(risk=risk, run_config=run_config)
-    exposure = make_exposure_book(
-        barrels_per_period=req.barrels_per_period,
-        horizon=req.horizon,
-    )
+def recommend(req: RecommendRequest) -> dict:
+    """
+    Run LangGraph hedging assistant and return dashboard-ready JSON.
+    """
 
     try:
-        rec = agent.recommend(history, exposure, req.forward_price)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        df = load_price_history_df(symbol="WTI")
 
-    # Build forecast fan data (P10/P50/P90 per period)
-    fc = agent.forecast(history, req.horizon)
-    paths = np.asarray(fc.paths)
-    fan = {
-        "p10": np.percentile(paths, 10, axis=0).tolist(),
-        "p25": np.percentile(paths, 25, axis=0).tolist(),
-        "p50": np.percentile(paths, 50, axis=0).tolist(),
-        "p75": np.percentile(paths, 75, axis=0).tolist(),
-        "p90": np.percentile(paths, 90, axis=0).tolist(),
-    }
+        df["date"] = pd.to_datetime(df["date"])
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df = df.dropna(subset=["date", "price"])
+        df = df[df["price"] > 0]
+        df = df.sort_values("date")
 
-    # Historical prices (last 24 periods for chart context)
-    hist_tail = history.prices[-24:].tolist()
-    hist_dates = [str(d)[:10] for d in history.dates[-24:]]
+        history = PriceHistory(
+            dates=df["date"].to_numpy(),
+            prices=df["price"].to_numpy(dtype=float),
+            symbol="WTI",
+        )
 
-    # Cost distribution (histogram buckets)
-    costs = rec.cost.costs
-    hist_counts, bin_edges = np.histogram(costs / 1e6, bins=40)
-    no_hedge_params = StrategyParams(StrategyType.STAGGERED, base_fraction=0.0)
-    no_hedge_cost = simulate_cost(fc, exposure, no_hedge_params, req.forward_price)
-    nh_counts, nh_edges = np.histogram(no_hedge_cost.costs / 1e6, bins=40)
+        exposure = make_exposure_book(
+            barrels_per_period=req.barrels_per_period,
+            horizon=req.horizon,
+            period_label="month",
+        )
 
-    # Candidate table
-    candidates = []
-    for r in rec.trace:
-        candidates.append({
-            "hedge_pct": round(r.params.base_fraction * 100, 1),
-            "expected_cost": round(r.score.cost / 1e6, 2),
-            "cvar": round(r.score.cvar / 1e6, 2),
-            "blended": round(r.score.blended / 1e6, 2),
-            "accepted": r.accepted,
-        })
+        risk = RiskAppetite(
+            w_cost=1.0,
+            w_cvar=req.cvar_weight,
+            w_opportunity=req.opportunity_weight,
+            w_execution=req.execution_weight,
+            cvar_alpha=0.95,
+            max_hedge=req.max_hedge,
+        )
 
-    return {
-        "rationale": rec.rationale,
-        "hedge_fraction": round(rec.policy.params.base_fraction * 100, 1),
-        "model_name": fc.model_name,
-        "regime": "N/A",  # populated if HMM used
-        "cost": {
-            "mean": round(rec.cost.mean / 1e6, 2),
-            "p10": round(rec.cost.p10 / 1e6, 2),
-            "p50": round(rec.cost.p50 / 1e6, 2),
-            "p90": round(rec.cost.p90 / 1e6, 2),
-            "cvar": round(rec.cost.cvar / 1e6, 2),
-            "ci_mean": [round(rec.cost.ci_mean[0]/1e6, 2), round(rec.cost.ci_mean[1]/1e6, 2)],
-            "ci_cvar": [round(rec.cost.ci_cvar[0]/1e6, 2), round(rec.cost.ci_cvar[1]/1e6, 2)],
-        },
-        "policy_schedule": [round(f, 3) for f in rec.policy.hedge_fractions.tolist()],
-        "forward_price": req.forward_price,
-        "fan": fan,
-        "history": {"dates": hist_dates, "prices": hist_tail},
-        "cost_histogram": {
-            "strategy": {"counts": hist_counts.tolist(), "edges": bin_edges.tolist()},
-            "no_hedge": {"counts": nh_counts.tolist(), "edges": nh_edges.tolist()},
-            "cvar_line": round(rec.cost.cvar / 1e6, 2),
-        },
-        "candidates": candidates,
-        "run_config": {
-            "n_paths": req.n_paths,
-            "model": fc.model_name,
-            "frequency": run_config.frequency,
-        },
-    }
+        # Model mapping:
+        # xgb-garch-t -> Phase 3 forecaster
+        # student-t   -> legacy GBM with Student-t shocks
+        # normal/gbm  -> legacy GBM normal shocks
+        # hmm         -> legacy GBM with regime hook
+        if req.model == "student-t":
+            distribution = "student-t"
+            model = "gbm"
+            use_regime = False
+        elif req.model == "hmm":
+            distribution = "normal"
+            model = "gbm"
+            use_regime = True
+        elif req.model in {"normal", "gbm"}:
+            distribution = "normal"
+            model = "gbm"
+            use_regime = False
+        else:
+            distribution = "normal"
+            model = "xgb-garch-t"
+            use_regime = False
+
+        # NOTE:
+        # This assumes run_agent has been/will be updated to accept `model`.
+        recommendation = run_agent(
+            history=history,
+            exposure=exposure,
+            risk=risk,
+            forward_price=req.forward_price,
+            frequency=req.frequency,
+            n_paths=req.n_paths,
+            seed=42,
+            calibration_window=req.calibration_window,
+            distribution=distribution,
+            use_regime=use_regime,
+            model=model,
+        )
+
+        costs = np.asarray(recommendation.cost.costs, dtype=float)
+
+        assumptions = getattr(recommendation, "assumptions", {}) or {}
+
+        forecast_obj = assumptions.get("forecast_obj")
+        fan = assumptions.get("fan")
+
+        if fan is None and forecast_obj is not None:
+            try:
+                fan = _build_fan_data(np.asarray(forecast_obj.paths, dtype=float))
+            except Exception:
+                fan = None
+
+        candidate_rows = []
+
+        for record in recommendation.trace:
+            candidate_rows.append(
+                {
+                    "strategy_type": record.params.strategy_type.value,
+                    "hedge_pct": round(_selected_hedge_pct(record.params), 1),
+                    "expected_cost": round(record.score.cost / 1e6, 2),
+                    "cvar": round(record.score.cvar / 1e6, 2),
+                    "opportunity_cost": round(record.score.opportunity_cost / 1e6, 2),
+                    "execution_risk": round(record.score.execution_risk / 1e6, 2),
+                    "blended": round(record.score.blended / 1e6, 2),
+                    "accepted": bool(record.accepted),
+                    "note": record.note,
+                }
+            )
+
+        hist_tail = history.prices[-24:].tolist()
+        hist_dates = [str(d)[:10] for d in history.dates[-24:]]
+
+        ci_mean = getattr(recommendation.cost, "ci_mean", None)
+        ci_cvar = getattr(recommendation.cost, "ci_cvar", None)
+
+        cost_histogram = assumptions.get("cost_histogram")
+
+        if cost_histogram is None:
+            cost_histogram = {
+                "strategy": _build_histogram(costs),
+                "cvar_line": round(recommendation.cost.cvar / 1e6, 2),
+            }
+
+        return {
+            "rationale": recommendation.rationale,
+            "hedge_fraction": round(
+                _selected_hedge_pct(recommendation.policy.params),
+                1,
+            ),
+            "selected_strategy_type": recommendation.policy.params.strategy_type.value,
+            "policy_description": recommendation.policy.description,
+            "policy_schedule": [
+                round(float(f), 3)
+                for f in recommendation.policy.hedge_fractions.tolist()
+            ],
+            "forward_price": req.forward_price,
+            "model_name": assumptions.get("forecast_model", model),
+            "frequency": assumptions.get("frequency", req.frequency),
+            "n_paths": assumptions.get("n_paths", req.n_paths),
+            "calibration_window": assumptions.get(
+                "calibration_window",
+                req.calibration_window,
+            ),
+            "fan": fan,
+            "cost": {
+                "mean": round(recommendation.cost.mean / 1e6, 2),
+                "p10": round(recommendation.cost.p10 / 1e6, 2),
+                "p50": round(recommendation.cost.p50 / 1e6, 2),
+                "p90": round(recommendation.cost.p90 / 1e6, 2),
+                "cvar": round(recommendation.cost.cvar / 1e6, 2),
+                "ci_mean": _safe_ci(ci_mean),
+                "ci_cvar": _safe_ci(ci_cvar),
+            },
+            "cost_histogram": cost_histogram,
+            "history": {
+                "dates": hist_dates,
+                "prices": hist_tail,
+            },
+            "candidates": candidate_rows,
+            "assumptions": _json_safe(assumptions),
+        }
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/stress-test")
-def stress_test(req: StressRequest):
-    history = load_price_history(symbol="WTI")
-    exposure = make_exposure_book(
-        barrels_per_period=req.barrels_per_period,
-        horizon=req.horizon,
-    )
+def stress_test(req: StressRequest) -> dict:
+    """
+    Run deterministic scenario stress tests for selected hedge fraction.
+    """
 
-    # Build a minimal PriceForecast wrapper for each scenario
-    from hedging_assistant.contracts import PriceForecast
-    params_hedged = StrategyParams(StrategyType.STAGGERED, base_fraction=req.hedge_fraction)
-    params_none   = StrategyParams(StrategyType.STAGGERED, base_fraction=0.0)
+    try:
+        df = load_price_history_df(symbol="WTI")
 
-    results = []
+        df["date"] = pd.to_datetime(df["date"])
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df = df.dropna(subset=["date", "price"])
+        df = df[df["price"] > 0]
+        df = df.sort_values("date")
 
-    all_scenarios = {**SCENARIOS, "Custom Shock": {"shock_pct": req.custom_shock_pct, "pattern": "linear"}}
-    base = history.prices[-1]
+        history = PriceHistory(
+            dates=df["date"].to_numpy(),
+            prices=df["price"].to_numpy(dtype=float),
+            symbol="WTI",
+        )
 
-    for name, cfg in all_scenarios.items():
-        path = _build_scenario_paths(base, req.horizon, cfg["shock_pct"], cfg["pattern"])
-        fc_stub = PriceForecast(paths=path, model_name="deterministic", frequency="M")
+        exposure = make_exposure_book(
+            barrels_per_period=req.barrels_per_period,
+            horizon=req.horizon,
+            period_label="month",
+        )
 
-        cost_hedged   = simulate_cost(fc_stub, exposure, params_hedged,   req.forward_price)
-        cost_no_hedge = simulate_cost(fc_stub, exposure, params_none,     req.forward_price)
+        params_hedged = StrategyParams(
+            strategy_type=StrategyType.STAGGERED,
+            base_fraction=req.hedge_fraction,
+            cap=1.0,
+        )
 
-        results.append({
-            "scenario": name,
-            "no_hedge_cost": round(cost_no_hedge.mean / 1e6, 2),
-            "hedged_cost":   round(cost_hedged.mean   / 1e6, 2),
-            "savings":       round((cost_no_hedge.mean - cost_hedged.mean) / 1e6, 2),
-            "shock_pct":     cfg["shock_pct"],
-        })
+        params_no_hedge = StrategyParams(
+            strategy_type=StrategyType.STAGGERED,
+            base_fraction=0.0,
+            cap=1.0,
+        )
 
-    return {"scenarios": results, "hedge_fraction": req.hedge_fraction}
+        base_price = float(history.prices[-1])
+
+        all_scenarios = {
+            **SCENARIOS,
+            "Custom Shock": {
+                "shock_pct": req.custom_shock_pct,
+                "pattern": "linear",
+            },
+        }
+
+        results = []
+
+        for name, cfg in all_scenarios.items():
+            scenario_path = _build_scenario_path(
+                base_price=base_price,
+                horizon=req.horizon,
+                shock_pct=cfg["shock_pct"],
+                pattern=cfg["pattern"],
+            )
+
+            forecast_stub = PriceForecast(
+                paths=scenario_path,
+                model_name="deterministic-scenario",
+                start_price=base_price,
+                frequency="M",
+            )
+
+            cost_hedged = simulate_cost(
+                forecast_obj=forecast_stub,
+                exposure=exposure,
+                params=params_hedged,
+                forward_price=req.forward_price,
+                cvar_alpha=0.95,
+                mode="optimized",
+            )
+
+            cost_no_hedge = simulate_cost(
+                forecast_obj=forecast_stub,
+                exposure=exposure,
+                params=params_no_hedge,
+                forward_price=req.forward_price,
+                cvar_alpha=0.95,
+                mode="optimized",
+            )
+
+            results.append(
+                {
+                    "scenario": name,
+                    "shock_pct": cfg["shock_pct"],
+                    "path": scenario_path.flatten().round(2).tolist(),
+                    "no_hedge_cost": round(cost_no_hedge.mean / 1e6, 2),
+                    "hedged_cost": round(cost_hedged.mean / 1e6, 2),
+                    "savings": round(
+                        (cost_no_hedge.mean - cost_hedged.mean) / 1e6,
+                        2,
+                    ),
+                }
+            )
+
+        return {
+            "base_price": round(base_price, 2),
+            "forward_price": req.forward_price,
+            "hedge_fraction": req.hedge_fraction,
+            "scenarios": results,
+        }
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

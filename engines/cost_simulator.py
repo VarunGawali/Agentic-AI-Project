@@ -1,29 +1,43 @@
 """
-Monte Carlo cost simulator: (PriceForecast, ExposureBook, StrategyParams,
-forward_price) -> CostDistribution
+Monte Carlo cost simulator.
 
-BASELINE (Phase 1): path-wise simulation with per-path strategy application,
-  dual-mode (accurate vs optimized), preallocated output array.
-UPGRADES:
-  #1  Vectorized Monte Carlo — no per-path loop in either mode
-  #5  Bootstrap confidence intervals on mean and CVaR
+Input:
+    PriceForecast + ExposureBook + StrategyParams + forward price/curve
 
-CHANGES:
-  - simulate_cost now accepts ForwardCurve in addition to scalar forward_price
-  - Added marginal_cvar() function: decomposes CVaR by period
-  - Phase 3: simulate_cost forks on is_path_dependent(); STAGGERED/CVaR-LP
-    fracs stay fully vectorised; TRIGGER/VOLATILITY/HYBRID/DP_OPTIMAL loop
-    per-path so each path sees its own state-dependent fraction schedule.
+Output:
+    CostDistribution
+
+Supports:
+    - Scalar forward price
+    - ForwardCurve / forward-price array
+    - Vectorized simulation for path-independent strategies
+    - Path-wise simulation for path-dependent strategies
+    - Bootstrap confidence intervals
+    - Marginal CVaR decomposition by period
+
+Phase 3:
+    - Uses strategy_library.is_path_dependent()
+    - STAGGERED remains fully vectorized
+    - TRIGGER / VOLATILITY / HYBRID / DP_OPTIMAL run path-wise
 """
 
 from __future__ import annotations
+
 import numpy as np
 
-from hedging_assistant.contracts import (
-    PriceForecast, ExposureBook, StrategyParams, CostDistribution,
+from contracts import (
+    PriceForecast,
+    ExposureBook,
+    StrategyParams,
+    CostDistribution,
 )
-from hedging_assistant.engines.strategy_library import apply_strategy, is_path_dependent
 
+from engines.strategy_library import apply_strategy, is_path_dependent
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap confidence intervals
+# ---------------------------------------------------------------------------
 
 def _bootstrap_ci(
     costs: np.ndarray,
@@ -31,116 +45,353 @@ def _bootstrap_ci(
     n_boot: int = 500,
     alpha: float = 0.95,
     seed: int = 0,
-) -> tuple:
+) -> tuple[float, float]:
     """
-    Compute bootstrap confidence interval for a scalar statistic.
+    Bootstrap confidence interval for a scalar statistic.
+    """
 
-    Uses numpy resampling only (no scipy dependency) — rng.choice with replacement.
-    Returns (low, high) at the given alpha level.
-    """
+    costs = np.asarray(costs, dtype=float)
+
+    if costs.ndim != 1:
+        raise ValueError("costs must be 1D for bootstrap")
+
+    if len(costs) == 0:
+        raise ValueError("costs cannot be empty for bootstrap")
+
+    if n_boot <= 0:
+        raise ValueError("n_boot must be positive")
+
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1")
+
     rng = np.random.default_rng(seed)
     boot_stats = np.empty(n_boot, dtype=float)
     n = len(costs)
+
     for i in range(n_boot):
-        sample = costs[rng.choice(n, size=n, replace=True)]
+        sample_idx = rng.choice(n, size=n, replace=True)
+        sample = costs[sample_idx]
         boot_stats[i] = statistic_fn(sample)
+
     lo = float(np.percentile(boot_stats, (1 - alpha) / 2 * 100))
     hi = float(np.percentile(boot_stats, (1 + alpha) / 2 * 100))
-    return (lo, hi)
 
+    return lo, hi
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_forward_curve(
+    forward_price,
+    horizon: int,
+) -> np.ndarray:
+    """
+    Convert scalar forward price or forward-curve-like object into array.
+
+    Supported:
+        - scalar float
+        - list/np.ndarray of shape (horizon,)
+        - object with .prices
+    """
+
+    if np.isscalar(forward_price):
+        if float(forward_price) <= 0:
+            raise ValueError(f"forward_price must be positive; got {forward_price}")
+
+        return np.full(horizon, float(forward_price), dtype=float)
+
+    if hasattr(forward_price, "prices"):
+        fwd_curve = np.asarray(forward_price.prices, dtype=float)
+    else:
+        fwd_curve = np.asarray(forward_price, dtype=float)
+
+    if fwd_curve.ndim != 1:
+        raise ValueError("forward curve must be a 1D array")
+
+    if len(fwd_curve) != horizon:
+        raise ValueError(
+            f"forward curve length {len(fwd_curve)} does not match "
+            f"forecast horizon {horizon}"
+        )
+
+    if np.any(fwd_curve <= 0):
+        raise ValueError("forward curve prices must all be positive")
+
+    return fwd_curve
+
+
+def _validate_inputs(
+    paths: np.ndarray,
+    volumes: np.ndarray,
+    exposure: ExposureBook,
+    cvar_alpha: float,
+) -> tuple[int, int]:
+    """
+    Shared validation for cost simulation.
+    """
+
+    if paths.ndim != 2:
+        raise ValueError("forecast_obj.paths must be 2D: (n_paths, horizon)")
+
+    n_paths, horizon = paths.shape
+
+    if n_paths == 0:
+        raise ValueError("forecast_obj.paths cannot have zero paths")
+
+    if horizon == 0:
+        raise ValueError("forecast horizon cannot be zero")
+
+    if volumes.ndim != 1:
+        raise ValueError("exposure.volumes must be 1D")
+
+    if len(volumes) != horizon:
+        raise ValueError(
+            f"Exposure horizon mismatch: exposure has {len(volumes)} periods, "
+            f"but forecast has {horizon} periods"
+        )
+
+    if hasattr(exposure, "horizon") and exposure.horizon != horizon:
+        raise ValueError(
+            f"ExposureBook.horizon mismatch: exposure.horizon={exposure.horizon}, "
+            f"forecast horizon={horizon}"
+        )
+
+    if np.any(paths <= 0):
+        raise ValueError("forecast paths must contain only positive prices")
+
+    if np.any(volumes < 0):
+        raise ValueError("exposure volumes cannot be negative")
+
+    if not 0 < cvar_alpha < 1:
+        raise ValueError(f"cvar_alpha must be between 0 and 1; got {cvar_alpha}")
+
+    return n_paths, horizon
+
+
+def _validate_hedge_fractions(
+    hedge_fractions: np.ndarray,
+    horizon: int,
+) -> None:
+    """
+    Validate strategy output.
+    """
+
+    hedge_fractions = np.asarray(hedge_fractions, dtype=float)
+
+    if hedge_fractions.ndim != 1:
+        raise ValueError("hedge fractions must be a 1D array")
+
+    if len(hedge_fractions) != horizon:
+        raise ValueError(
+            f"Strategy returned {len(hedge_fractions)} hedge fractions, "
+            f"expected {horizon}"
+        )
+
+    if np.any((hedge_fractions < 0) | (hedge_fractions > 1)):
+        raise ValueError("hedge fractions must be between 0 and 1")
+
+
+def _cvar_stat(
+    costs: np.ndarray,
+    cvar_alpha: float,
+) -> float:
+    """
+    CVaR = average of worst upper-tail costs.
+    """
+
+    costs = np.asarray(costs, dtype=float)
+
+    threshold = np.percentile(costs, cvar_alpha * 100)
+    tail = costs[costs >= threshold]
+
+    return float(tail.mean()) if len(tail) else float(threshold)
+
+
+# ---------------------------------------------------------------------------
+# Main simulator
+# ---------------------------------------------------------------------------
 
 def simulate_cost(
     forecast_obj: PriceForecast,
     exposure: ExposureBook,
     params: StrategyParams,
-    forward_price,          # float OR ForwardCurve
+    forward_price,
     cvar_alpha: float = 0.95,
-    mode: str = "accurate",
+    mode: str = "optimized",
+    compute_ci: bool = False,
+    n_boot: int = 500,
+    ci_alpha: float = 0.95,
+    seed: int = 0,
 ) -> CostDistribution:
     """
-    Simulate total procurement cost distribution over all forecast paths.
+    Simulate total procurement cost distribution.
 
-    Improvement #1: Fully vectorized — no per-path for loop even in "accurate"
-    mode. This is safe for path-independent strategies (e.g. staggered) because
-    apply_strategy returns the same fractions regardless of which path is passed.
-    Applying once on paths[0] and broadcasting is mathematically identical to
-    applying per-path, since the output is constant across paths.
+    Formula:
+        total_cost =
+            sum_t(hedge_fraction_t * volume_t * forward_price_t)
+            +
+            sum_t((1 - hedge_fraction_t) * volume_t * spot_price_t)
 
-    Improvement #5: Bootstrap CIs computed on mean and CVaR.
-
-    Args:
-        forecast_obj: PriceForecast with paths (n_paths, horizon)
-        exposure: ExposureBook with volumes (horizon,)
-        params: StrategyParams defining the hedging rule
-        forward_price: price locked in for hedged volumes — float (USD/bbl) or ForwardCurve
-        cvar_alpha: tail level for CVaR computation (default 0.95 = worst 5%)
-        mode: "accurate" or "optimized" — both fully vectorized now;
-              mode parameter kept for API compatibility
-
-    Returns:
-        CostDistribution with per-path costs, summary stats, and bootstrap CIs
+    Phase 3 behavior:
+        If strategy is path-dependent, simulator automatically uses path-wise
+        accurate evaluation even if mode='optimized' is passed.
     """
-    from hedging_assistant.contracts import ForwardCurve
 
-    paths = np.asarray(forecast_obj.paths, dtype=float)       # (n_paths, horizon)
-    volumes = np.asarray(exposure.volumes, dtype=float)        # (horizon,)
+    mode = mode.lower()
 
-    n_paths, horizon = paths.shape
-    if len(volumes) != horizon:
-        raise ValueError(
-            f"exposure.volumes length {len(volumes)} != forecast horizon {horizon}"
-        )
+    if mode not in {"optimized", "accurate"}:
+        raise ValueError("mode must be either 'optimized' or 'accurate'")
 
-    # Resolve forward price to a curve
-    if isinstance(forward_price, ForwardCurve):
-        fwd_curve = np.asarray(forward_price.prices, dtype=float)
-    else:
-        if forward_price <= 0:
-            raise ValueError(f"forward_price must be positive; got {forward_price}")
-        fwd_curve = np.full(horizon, float(forward_price))
+    paths = np.asarray(forecast_obj.paths, dtype=float)
+    volumes = np.asarray(exposure.volumes, dtype=float)
 
-    if not (0 < cvar_alpha < 1):
-        raise ValueError(f"cvar_alpha must be in (0, 1); got {cvar_alpha}")
+    _, horizon = _validate_inputs(
+        paths=paths,
+        volumes=volumes,
+        exposure=exposure,
+        cvar_alpha=cvar_alpha,
+    )
+
+    fwd_curve = _resolve_forward_curve(
+        forward_price=forward_price,
+        horizon=horizon,
+    )
 
     if is_path_dependent(params):
-        # Path-dependent strategies: each path sees its own fraction schedule
-        # based on the prices it realises — must loop.
-        total_costs = np.empty(n_paths)
-        for i in range(n_paths):
-            frac = apply_strategy(params, paths[i])
-            total_costs[i] = (
-                (frac * volumes * fwd_curve).sum()
-                + ((1.0 - frac) * volumes * paths[i]).sum()
-            )
+        total_costs = _simulate_cost_accurate(
+            paths=paths,
+            volumes=volumes,
+            params=params,
+            fwd_curve=fwd_curve,
+        )
+
     else:
-        # Improvement #1: vectorized — safe for path-independent strategies.
-        # apply_strategy returns the same fracs for any path, so compute once.
-        frac = apply_strategy(params, paths[0])   # shape (horizon,)
-        if len(frac) != horizon:
-            raise ValueError(
-                f"apply_strategy returned {len(frac)} fractions; expected {horizon}"
-            )
-        if np.any(frac < 0) or np.any(frac > 1):
-            raise ValueError("hedge fractions must be in [0, 1]")
+        total_costs = _simulate_cost_optimized(
+            paths=paths,
+            volumes=volumes,
+            params=params,
+            fwd_curve=fwd_curve,
+        )
 
-        hedged_cost    = (frac * volumes * fwd_curve).sum()
-        unhedged_costs = ((1.0 - frac) * volumes * paths).sum(axis=1)
-        total_costs    = hedged_cost + unhedged_costs
+    dist = CostDistribution(
+        costs=total_costs,
+        cvar_alpha=cvar_alpha,
+    )
 
-    # Improvement #5: bootstrap CIs on mean and CVaR
-    def _cvar_stat(c: np.ndarray) -> float:
-        thr = np.percentile(c, cvar_alpha * 100)
-        tail = c[c >= thr]
-        return float(tail.mean()) if len(tail) else float(thr)
+    if compute_ci:
+        dist.ci_mean = _bootstrap_ci(
+            costs=total_costs,
+            statistic_fn=np.mean,
+            n_boot=n_boot,
+            alpha=ci_alpha,
+            seed=seed,
+        )
 
-    ci_mean = _bootstrap_ci(total_costs, np.mean)
-    ci_cvar = _bootstrap_ci(total_costs, _cvar_stat)
+        dist.ci_cvar = _bootstrap_ci(
+            costs=total_costs,
+            statistic_fn=lambda c: _cvar_stat(c, cvar_alpha),
+            n_boot=n_boot,
+            alpha=ci_alpha,
+            seed=seed,
+        )
 
-    dist = CostDistribution(costs=total_costs, cvar_alpha=cvar_alpha)
-    dist.ci_mean = ci_mean
-    dist.ci_cvar = ci_cvar
     return dist
 
+
+# ---------------------------------------------------------------------------
+# Optimized vectorized simulation
+# ---------------------------------------------------------------------------
+
+def _simulate_cost_optimized(
+    paths: np.ndarray,
+    volumes: np.ndarray,
+    params: StrategyParams,
+    fwd_curve: np.ndarray,
+) -> np.ndarray:
+    """
+    Vectorized simulation.
+
+    Safe for path-independent strategies like STAGGERED.
+    """
+
+    horizon = paths.shape[1]
+
+    hedge_fractions = apply_strategy(
+        params=params,
+        price_path=paths[0],
+    )
+
+    _validate_hedge_fractions(
+        hedge_fractions=hedge_fractions,
+        horizon=horizon,
+    )
+
+    hedged_cost = np.sum(
+        hedge_fractions * volumes * fwd_curve
+    )
+
+    unhedged_costs = np.sum(
+        (1.0 - hedge_fractions) * volumes * paths,
+        axis=1,
+    )
+
+    return hedged_cost + unhedged_costs
+
+
+# ---------------------------------------------------------------------------
+# Accurate path-wise simulation
+# ---------------------------------------------------------------------------
+
+def _simulate_cost_accurate(
+    paths: np.ndarray,
+    volumes: np.ndarray,
+    params: StrategyParams,
+    fwd_curve: np.ndarray,
+) -> np.ndarray:
+    """
+    Path-wise simulation.
+
+    Required for:
+        TRIGGER
+        VOLATILITY
+        HYBRID
+        DP_OPTIMAL
+    """
+
+    n_paths, horizon = paths.shape
+    total_costs = np.empty(n_paths, dtype=float)
+
+    for i in range(n_paths):
+        price_path = paths[i]
+
+        hedge_fractions = apply_strategy(
+            params=params,
+            price_path=price_path,
+        )
+
+        _validate_hedge_fractions(
+            hedge_fractions=hedge_fractions,
+            horizon=horizon,
+        )
+
+        hedged_cost = hedge_fractions * volumes * fwd_curve
+
+        unhedged_cost = (
+            (1.0 - hedge_fractions)
+            * volumes
+            * price_path
+        )
+
+        total_costs[i] = np.sum(hedged_cost + unhedged_cost)
+
+    return total_costs
+
+
+# ---------------------------------------------------------------------------
+# Marginal CVaR by period
+# ---------------------------------------------------------------------------
 
 def marginal_cvar(
     forecast_obj: PriceForecast,
@@ -148,36 +399,160 @@ def marginal_cvar(
     params: StrategyParams,
     forward_price,
     cvar_alpha: float = 0.95,
+    mode: str = "optimized",
 ) -> np.ndarray:
     """
     Marginal CVaR decomposition by period.
 
-    Returns shape (horizon,) array where entry t is the contribution of period t
-    to the overall CVaR — i.e. mean cost in period t conditional on being in the
-    tail. Tells the trader which delivery month drives tail risk most.
+    Returns:
+        np.ndarray of shape (horizon,)
 
-    Computed as: for each path in the CVaR tail, extract per-period costs,
-    then average across tail paths.
+    Interpretation:
+        Each value shows average period-level cost contribution inside the
+        worst CVaR tail scenarios.
     """
-    from hedging_assistant.contracts import ForwardCurve
+
+    mode = mode.lower()
+
+    if mode not in {"optimized", "accurate"}:
+        raise ValueError("mode must be either 'optimized' or 'accurate'")
+
     paths = np.asarray(forecast_obj.paths, dtype=float)
     volumes = np.asarray(exposure.volumes, dtype=float)
-    n_paths, horizon = paths.shape
 
-    frac = apply_strategy(params, paths[0])
-    if isinstance(forward_price, ForwardCurve):
-        fwd_curve = np.asarray(forward_price.prices, dtype=float)
-    else:
-        fwd_curve = np.full(horizon, float(forward_price))
-
-    # per-path, per-period costs: shape (n_paths, horizon)
-    period_costs = (
-        frac * volumes * fwd_curve +           # hedged portion (scalar per period)
-        (1.0 - frac) * volumes * paths         # unhedged portion
+    _, horizon = _validate_inputs(
+        paths=paths,
+        volumes=volumes,
+        exposure=exposure,
+        cvar_alpha=cvar_alpha,
     )
-    total_costs = period_costs.sum(axis=1)     # shape (n_paths,)
+
+    fwd_curve = _resolve_forward_curve(
+        forward_price=forward_price,
+        horizon=horizon,
+    )
+
+    if is_path_dependent(params):
+        period_costs = _period_costs_accurate(
+            paths=paths,
+            volumes=volumes,
+            params=params,
+            fwd_curve=fwd_curve,
+        )
+    else:
+        period_costs = _period_costs_optimized(
+            paths=paths,
+            volumes=volumes,
+            params=params,
+            fwd_curve=fwd_curve,
+        )
+
+    total_costs = period_costs.sum(axis=1)
 
     threshold = np.percentile(total_costs, cvar_alpha * 100)
-    tail_mask = total_costs >= threshold       # bool (n_paths,)
-    tail_period_costs = period_costs[tail_mask]  # shape (n_tail, horizon)
-    return tail_period_costs.mean(axis=0)      # shape (horizon,)
+    tail_mask = total_costs >= threshold
+
+    if not np.any(tail_mask):
+        return np.zeros(horizon, dtype=float)
+
+    tail_period_costs = period_costs[tail_mask]
+
+    return tail_period_costs.mean(axis=0)
+
+
+def _period_costs_optimized(
+    paths: np.ndarray,
+    volumes: np.ndarray,
+    params: StrategyParams,
+    fwd_curve: np.ndarray,
+) -> np.ndarray:
+    """
+    Vectorized per-period costs for path-independent strategies.
+
+    Returns:
+        array of shape (n_paths, horizon)
+    """
+
+    horizon = paths.shape[1]
+
+    hedge_fractions = apply_strategy(
+        params=params,
+        price_path=paths[0],
+    )
+
+    _validate_hedge_fractions(
+        hedge_fractions=hedge_fractions,
+        horizon=horizon,
+    )
+
+    period_costs = (
+        hedge_fractions * volumes * fwd_curve
+        + (1.0 - hedge_fractions) * volumes * paths
+    )
+
+    return period_costs
+
+
+def _period_costs_accurate(
+    paths: np.ndarray,
+    volumes: np.ndarray,
+    params: StrategyParams,
+    fwd_curve: np.ndarray,
+) -> np.ndarray:
+    """
+    Path-wise per-period costs for path-dependent strategies.
+
+    Returns:
+        array of shape (n_paths, horizon)
+    """
+
+    n_paths, horizon = paths.shape
+    period_costs = np.empty((n_paths, horizon), dtype=float)
+
+    for i in range(n_paths):
+        price_path = paths[i]
+
+        hedge_fractions = apply_strategy(
+            params=params,
+            price_path=price_path,
+        )
+
+        _validate_hedge_fractions(
+            hedge_fractions=hedge_fractions,
+            horizon=horizon,
+        )
+
+        period_costs[i] = (
+            hedge_fractions * volumes * fwd_curve
+            + (1.0 - hedge_fractions) * volumes * price_path
+        )
+
+    return period_costs
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible wrapper
+# ---------------------------------------------------------------------------
+
+def simulate_cost_fast(
+    forecast_obj: PriceForecast,
+    exposure: ExposureBook,
+    params: StrategyParams,
+    forward_price,
+    cvar_alpha: float = 0.95,
+) -> CostDistribution:
+    """
+    Backward-compatible wrapper.
+
+    Old test scripts can still call simulate_cost_fast().
+    """
+
+    return simulate_cost(
+        forecast_obj=forecast_obj,
+        exposure=exposure,
+        params=params,
+        forward_price=forward_price,
+        cvar_alpha=cvar_alpha,
+        mode="optimized",
+        compute_ci=False,
+    )

@@ -1,64 +1,154 @@
 """
-Data layer: load crude oil price history.
+Data ingestion: load WTI/Brent crude oil price history from EIA.
 
-Primary source: EIA open data API (free, public domain). Daily WTI (Cushing)
-spot prices, series RWTC; Brent is RBRTE.
-  Docs: https://www.eia.gov/opendata/  (register for a free API key)
+Cloud behavior:
+    1. Download existing CSV from Azure Blob Storage if configured.
+    2. Fetch only new rows from EIA after latest saved date.
+    3. Append, deduplicate, sort.
+    4. Upload updated CSV back to Azure Blob Storage.
+    5. Return pandas DataFrame.
 
-If no API key is supplied (or the network is unavailable), this falls back to a
-realistic SYNTHETIC WTI series so the rest of the pipeline can be built and
-tested today. The synthetic series is clearly flagged so it is never mistaken
-for real data.
-
-CHANGES:
-  - Added incremental refresh: refresh() pulls only trailing 30-day window
-    + anything newer, merges, dedups, re-sorts, writes parquet snapshot.
-  - Added load_cached() to read the snapshot without a network call.
-  - Added save_snapshot() / load_snapshot() helpers.
-  - Full pull still available via load_price_history(force_full=False).
+Local fallback:
+    If Azure Blob env vars are not configured, use data/raw/*.csv locally.
 """
 
 from __future__ import annotations
-import os
-from pathlib import Path
-import numpy as np
-import pandas as pd
 
-from hedging_assistant.contracts import PriceHistory, ExposureBook, RiskAppetite
+import os
+from io import BytesIO
+from pathlib import Path
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+
+try:
+    from azure.storage.blob import BlobServiceClient
+except ImportError:
+    BlobServiceClient = None
+
+
+load_dotenv()
 
 EIA_BASE = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
-SERIES = {"WTI": "RWTC", "BRENT": "RBRTE"}
-PAGE_SIZE = 5000   # EIA max rows per request
 
-SNAPSHOT_DIR = Path(__file__).parent.parent / "data" / "snapshots"
-SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+SERIES = {
+    "WTI": "RWTC",
+    "BRENT": "RBRTE",
+}
+
+DEFAULT_DATA_DIR = Path("data/raw")
 
 
 def load_price_history(
     symbol: str = "WTI",
-    api_key: str | None = None,
     start: str = "2010-01-01",
-) -> PriceHistory:
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
     """
-    Returns a PriceHistory. Uses EIA if an API key is available, else synthetic.
-    Set the key via arg or the EIA_API_KEY environment variable.
+    Load crude price history.
+
+    In cloud:
+        Uses Azure Blob Storage when AZURE_STORAGE_CONNECTION_STRING is set.
+
+    Locally:
+        Falls back to data/raw/{symbol}_price_history.csv.
+
+    Behavior:
+        1. Load existing cloud/local CSV if available.
+        2. Determine fetch_start.
+        3. Fetch new EIA rows.
+        4. Merge/deduplicate/sort.
+        5. Save back to Blob or local CSV.
+        6. Return updated DataFrame.
     """
-    api_key = api_key or os.environ.get("EIA_API_KEY")
-    if api_key:
-        try:
-            return _load_from_eia(symbol, api_key, start)
-        except Exception as e:  # pragma: no cover - network dependent
-            print(f"[data] EIA fetch failed ({e}); using synthetic fallback.")
+
+    symbol = symbol.upper()
+
+    if symbol not in SERIES:
+        raise ValueError(f"Unsupported symbol: {symbol}. Use WTI or BRENT.")
+
+    api_key = os.environ.get("EIA_API_KEY")
+
+    if not api_key:
+        raise ValueError("EIA_API_KEY not found. Set it as an environment variable.")
+
+    existing_df = pd.DataFrame()
+
+    use_blob = _is_blob_configured()
+
+    if use_blob:
+        existing_df = _download_from_blob(symbol=symbol)
+
+        if force_refresh or existing_df.empty:
+            fetch_start = start
+            print(f"[data] Blob has no existing {symbol} data. Fetching from {fetch_start}.")
+        else:
+            existing_df["date"] = pd.to_datetime(existing_df["date"])
+            last_date = existing_df["date"].max()
+            fetch_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+            print(f"[data] Blob {symbol} data found up to {last_date.date()}.")
+            print(f"[data] Fetching new rows from {fetch_start}.")
+
     else:
-        print("[data] No EIA_API_KEY found; using synthetic fallback.")
-    return _synthetic_history(symbol, start)
+        data_dir = Path(data_dir)
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        local_path = data_dir / f"{symbol.lower()}_price_history.csv"
+
+        if force_refresh or not local_path.exists():
+            existing_df = pd.DataFrame()
+            fetch_start = start
+            print(f"[data] Local {symbol} data missing. Fetching from {fetch_start}.")
+        else:
+            existing_df = pd.read_csv(local_path)
+            existing_df["date"] = pd.to_datetime(existing_df["date"])
+
+            last_date = existing_df["date"].max()
+            fetch_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+            print(f"[data] Local {symbol} data found up to {last_date.date()}.")
+            print(f"[data] Fetching new rows from {fetch_start}.")
+
+    new_df = fetch_eia_price_data(
+        symbol=symbol,
+        api_key=api_key,
+        start=fetch_start,
+    )
+
+    combined_df = merge_price_data(
+        local_df=existing_df,
+        new_df=new_df,
+        symbol=symbol,
+    )
+
+    if use_blob:
+        _upload_to_blob(symbol=symbol, df=combined_df)
+        print(f"[data] Uploaded {len(combined_df)} rows to Blob for {symbol}.")
+    else:
+        local_path = Path(data_dir) / f"{symbol.lower()}_price_history.csv"
+        combined_df.to_csv(local_path, index=False)
+        print(f"[data] Saved {len(combined_df)} rows to {local_path}.")
+
+    return combined_df
 
 
-def _load_from_eia(symbol: str, api_key: str, start: str) -> PriceHistory:  # pragma: no cover
-    import requests
+def fetch_eia_price_data(
+    symbol: str,
+    api_key: str,
+    start: str,
+) -> pd.DataFrame:
+    """
+    Fetch EIA crude price data using pagination.
+    """
+
     series_id = SERIES[symbol.upper()]
-    all_rows: list[dict] = []
+    all_rows = []
+
     offset = 0
+    page_size = 5000
 
     while True:
         params = {
@@ -69,173 +159,174 @@ def _load_from_eia(symbol: str, api_key: str, start: str) -> PriceHistory:  # pr
             "start": start,
             "sort[0][column]": "period",
             "sort[0][direction]": "asc",
-            "length": PAGE_SIZE,
+            "length": page_size,
             "offset": offset,
         }
-        r = requests.get(EIA_BASE, params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json()["response"]
-        rows = payload.get("data", [])
+
+        response = requests.get(EIA_BASE, params=params, timeout=30)
+        response.raise_for_status()
+
+        rows = response.json().get("response", {}).get("data", [])
+
+        if not rows:
+            break
+
         all_rows.extend(rows)
 
-        if len(rows) < PAGE_SIZE:
+        if len(rows) < page_size:
             break
-        offset += PAGE_SIZE
+
+        offset += page_size
 
     if not all_rows:
-        raise ValueError(f"EIA returned no data for {series_id} from {start}")
+        return pd.DataFrame(columns=["date", "price", "symbol", "source"])
 
     df = pd.DataFrame(all_rows)
-    df = df[df["value"].notna() & (df["value"] != "")]
-    df["period"] = pd.to_datetime(df["period"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["value"])
-    df = df.sort_values("period").drop_duplicates(subset=["period"])
 
-    print(f"[data] EIA: loaded {len(df)} rows for {series_id} "
-          f"({df['period'].min().date()} → {df['period'].max().date()})")
-
-    return PriceHistory(
-        dates=df["period"].values,
-        prices=df["value"].values,
-        symbol=symbol.upper(),
+    df = df.rename(
+        columns={
+            "period": "date",
+            "value": "price",
+        }
     )
 
+    df = df[["date", "price"]]
 
-def _synthetic_history(symbol: str, start: str) -> PriceHistory:
-    """
-    Realistic-looking WTI: mean-reverting-ish level with volatility clustering
-    and occasional jumps, so downstream models have something with structure to
-    chew on. NOT real data -- flagged in the symbol.
-    """
-    rng = np.random.default_rng(42)
-    n = 3000
-    dates = pd.bdate_range(start=start, periods=n).values
-    mu_level = 75.0
-    price = 60.0
-    prices = []
-    vol = 0.02
-    for _ in range(n):
-        # volatility clustering: vol drifts and spikes
-        vol = 0.9 * vol + 0.1 * abs(rng.normal(0, 0.02)) + 0.001
-        shock = rng.normal(0, vol)
-        # mild mean reversion toward mu_level
-        drift = 0.002 * (mu_level - price) / mu_level
-        # occasional geopolitical jump
-        jump = rng.normal(0, 0.08) if rng.random() < 0.01 else 0.0
-        price *= np.exp(drift + shock + jump)
-        price = max(price, 5.0)
-        prices.append(price)
-    return PriceHistory(
-        dates=dates,
-        prices=np.array(prices),
-        symbol=f"{symbol.upper()}_SYNTHETIC",
-    )
-
-
-def make_exposure_book(barrels_per_period: float = 100_000,
-                       horizon: int = 6,
-                       period_label: str = "month") -> ExposureBook:
-    """A simple constant exposure book: same volume needed each period."""
-    return ExposureBook(
-        volumes=np.full(horizon, float(barrels_per_period)),
-        period_label=period_label,
-    )
-
-
-def default_risk_appetite() -> RiskAppetite:
-    return RiskAppetite()
-
-
-# ----------------------------------------------------------------------------
-# Snapshot helpers (Feature 5: incremental EIA refresh)
-# ----------------------------------------------------------------------------
-
-def _snapshot_path(symbol: str) -> Path:
-    return SNAPSHOT_DIR / f"{symbol.upper()}_latest.parquet"
-
-
-def save_snapshot(history: PriceHistory) -> None:
-    """Write PriceHistory to a parquet snapshot (idempotent)."""
-    path = _snapshot_path(history.symbol.replace("_SYNTHETIC", ""))
-    df = pd.DataFrame({"date": history.dates, "price": history.prices})
-    df.to_parquet(path, index=False)
-    print(f"[data] Snapshot saved: {path} ({len(df)} rows)")
-
-
-def load_snapshot(symbol: str) -> PriceHistory | None:
-    """Read the latest parquet snapshot. Returns None if not found."""
-    path = _snapshot_path(symbol)
-    if not path.exists():
-        return None
-    df = pd.read_parquet(path)
     df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").drop_duplicates(subset=["date"])
-    return PriceHistory(
-        dates=df["date"].values,
-        prices=df["price"].values,
-        symbol=symbol.upper(),
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+    df = df.dropna(subset=["date", "price"])
+    df = df.sort_values("date").drop_duplicates("date", keep="last")
+
+    df["symbol"] = symbol.upper()
+    df["source"] = "EIA"
+
+    return df.reset_index(drop=True)
+
+
+def merge_price_data(
+    local_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    symbol: str,
+) -> pd.DataFrame:
+    """
+    Merge existing and newly fetched price data.
+    Remove duplicate rows by date.
+    """
+
+    frames = []
+
+    if local_df is not None and not local_df.empty:
+        frames.append(local_df)
+
+    if new_df is not None and not new_df.empty:
+        frames.append(new_df)
+
+    if not frames:
+        return pd.DataFrame(columns=["date", "price", "symbol", "source"])
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    combined["date"] = pd.to_datetime(combined["date"])
+    combined["price"] = pd.to_numeric(combined["price"], errors="coerce")
+    combined["symbol"] = symbol.upper()
+
+    if "source" not in combined.columns:
+        combined["source"] = "EIA"
+
+    combined["source"] = combined["source"].fillna("EIA")
+
+    combined = combined.dropna(subset=["date", "price"])
+    combined = combined[combined["price"] > 0]
+    combined = combined.sort_values("date")
+    combined = combined.drop_duplicates("date", keep="last")
+    combined = combined.reset_index(drop=True)
+
+    combined["date"] = combined["date"].dt.strftime("%Y-%m-%d")
+
+    return combined
+
+
+def _is_blob_configured() -> bool:
+    """
+    Return True when Azure Blob environment variables are available.
+    """
+
+    return bool(os.environ.get("AZURE_STORAGE_CONNECTION_STRING"))
+
+
+def _get_blob_client(symbol: str):
+    """
+    Get Azure Blob client for the symbol CSV.
+    """
+
+    if BlobServiceClient is None:
+        raise ImportError(
+            "azure-storage-blob is not installed. Add it to requirements.txt."
+        )
+
+    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+    container_name = os.environ.get("BLOB_CONTAINER_NAME", "market-data")
+    blob_name = os.environ.get(
+        f"{symbol.upper()}_BLOB_NAME",
+        f"{symbol.lower()}_price_history.csv",
+    )
+
+    blob_service_client = BlobServiceClient.from_connection_string(
+        connection_string
+    )
+
+    return blob_service_client.get_blob_client(
+        container=container_name,
+        blob=blob_name,
     )
 
 
-def load_cached(symbol: str = "WTI") -> PriceHistory | None:
-    """Read the snapshot without a network call. Returns None if not found."""
-    return load_snapshot(symbol)
-
-
-def refresh(symbol: str = "WTI", api_key: str | None = None, trailing_days: int = 30) -> PriceHistory:
+def _download_from_blob(symbol: str) -> pd.DataFrame:
     """
-    Incremental EIA refresh per CLAUDE.md spec:
-    1. Load existing snapshot (if any)
-    2. Pull only trailing_days window + anything newer from EIA
-    3. Merge + dedup by date + re-sort
-    4. Write back to snapshot
-    5. Return merged PriceHistory
-
-    This is SEPARATE from the read path — pipeline runs read the snapshot,
-    never trigger a network call mid-run.
+    Download existing price CSV from Azure Blob.
+    If blob does not exist, return empty DataFrame.
     """
-    api_key = api_key or os.environ.get("EIA_API_KEY")
-    if not api_key:
-        raise ValueError("EIA_API_KEY required for refresh(). Use load_snapshot() to read cached data.")
 
-    existing = load_snapshot(symbol)
-    if existing is not None:
-        # compute the trailing window start date
-        last_date = pd.to_datetime(existing.dates).max()
-        window_start = (last_date - pd.Timedelta(days=trailing_days)).strftime("%Y-%m-%d")
-        print(f"[data] Incremental refresh from {window_start} (trailing {trailing_days}d + new)")
-    else:
-        window_start = "2010-01-01"
-        print(f"[data] No snapshot found — full pull from {window_start}")
+    blob_client = _get_blob_client(symbol)
 
-    fresh = _load_from_eia(symbol, api_key, window_start)
+    try:
+        blob_bytes = blob_client.download_blob().readall()
+    except Exception as exc:
+        message = str(exc).lower()
 
-    if existing is not None:
-        # merge: combine existing + fresh, dedup by date, re-sort
-        old_df = pd.DataFrame({"date": existing.dates, "price": existing.prices})
-        new_df = pd.DataFrame({"date": fresh.dates, "price": fresh.prices})
-        merged = pd.concat([old_df, new_df], ignore_index=True)
-        merged["date"] = pd.to_datetime(merged["date"])
-        merged = merged.sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
-        result = PriceHistory(
-            dates=merged["date"].values,
-            prices=merged["price"].values,
-            symbol=symbol.upper(),
-        )
-        print(f"[data] Merged: {len(old_df)} existing + {len(new_df)} fresh → {len(merged)} total")
-    else:
-        result = fresh
+        if "blobnotfound" in message or "not found" in message:
+            return pd.DataFrame(columns=["date", "price", "symbol", "source"])
 
-    save_snapshot(result)
-    return result
+        raise
+
+    if not blob_bytes:
+        return pd.DataFrame(columns=["date", "price", "symbol", "source"])
+
+    return pd.read_csv(BytesIO(blob_bytes))
+
+
+def _upload_to_blob(symbol: str, df: pd.DataFrame) -> None:
+    """
+    Upload updated price CSV to Azure Blob.
+    """
+
+    blob_client = _get_blob_client(symbol)
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+    blob_client.upload_blob(
+        csv_bytes,
+        overwrite=True,
+    )
 
 
 if __name__ == "__main__":
-    hist = load_price_history()
-    print(f"Loaded {len(hist)} prices for {hist.symbol}")
-    print(f"  range: {hist.prices.min():.1f} - {hist.prices.max():.1f} USD/bbl")
-    print(f"  last:  {hist.prices[-1]:.1f}")
-    book = make_exposure_book()
-    print(f"Exposure: {book.volumes[0]:,.0f} bbl/{book.period_label} "
-          f"x {book.horizon} {book.period_label}s")
+    df = load_price_history(symbol="WTI", start="2010-01-01")
+
+    print(df.head())
+    print(df.tail())
+
+    print(f"Rows loaded: {len(df)}")
+    print(f"Date range: {df['date'].min()} to {df['date'].max()}")
+    print(f"Latest price: {df['price'].iloc[-1]:.2f} USD/bbl")
