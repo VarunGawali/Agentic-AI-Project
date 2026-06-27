@@ -14,6 +14,7 @@ Local fallback:
 
 from __future__ import annotations
 
+import logging
 import os
 from io import BytesIO
 from pathlib import Path
@@ -21,6 +22,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 try:
     from azure.storage.blob import BlobServiceClient
@@ -83,14 +86,14 @@ def load_price_history(
 
         if force_refresh or existing_df.empty:
             fetch_start = start
-            print(f"[data] Blob has no existing {symbol} data. Fetching from {fetch_start}.")
+            logger.info("Blob has no existing %s data. Fetching from %s.", symbol, fetch_start)
         else:
             existing_df["date"] = pd.to_datetime(existing_df["date"])
             last_date = existing_df["date"].max()
             fetch_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-            print(f"[data] Blob {symbol} data found up to {last_date.date()}.")
-            print(f"[data] Fetching new rows from {fetch_start}.")
+            logger.info("Blob %s data found up to %s.", symbol, last_date.date())
+            logger.info("Fetching new rows from %s.", fetch_start)
 
     else:
         data_dir = Path(data_dir)
@@ -101,7 +104,7 @@ def load_price_history(
         if force_refresh or not local_path.exists():
             existing_df = pd.DataFrame()
             fetch_start = start
-            print(f"[data] Local {symbol} data missing. Fetching from {fetch_start}.")
+            logger.info("Local %s data missing. Fetching from %s.", symbol, fetch_start)
         else:
             existing_df = pd.read_csv(local_path)
             existing_df["date"] = pd.to_datetime(existing_df["date"])
@@ -109,8 +112,8 @@ def load_price_history(
             last_date = existing_df["date"].max()
             fetch_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-            print(f"[data] Local {symbol} data found up to {last_date.date()}.")
-            print(f"[data] Fetching new rows from {fetch_start}.")
+            logger.info("Local %s data found up to %s.", symbol, last_date.date())
+            logger.info("Fetching new rows from %s.", fetch_start)
 
     new_df = fetch_eia_price_data(
         symbol=symbol,
@@ -126,11 +129,11 @@ def load_price_history(
 
     if use_blob:
         _upload_to_blob(symbol=symbol, df=combined_df)
-        print(f"[data] Uploaded {len(combined_df)} rows to Blob for {symbol}.")
+        logger.info("Uploaded %d rows to Blob for %s.", len(combined_df), symbol)
     else:
         local_path = Path(data_dir) / f"{symbol.lower()}_price_history.csv"
         combined_df.to_csv(local_path, index=False)
-        print(f"[data] Saved {len(combined_df)} rows to {local_path}.")
+        logger.info("Saved %d rows to %s.", len(combined_df), local_path)
 
     return combined_df
 

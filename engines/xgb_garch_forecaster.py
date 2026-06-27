@@ -14,6 +14,9 @@ Outputs:
 from __future__ import annotations
 
 import json
+import logging
+import os
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -27,9 +30,70 @@ from hedging_assistant.engines.features import (
     build_features,
 )
 
+logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_PATH = Path("models/xgb_drift_model.json")
-DEFAULT_FEATURE_COLUMNS_PATH = Path("models/xgb_feature_columns.json")
+# Env-overridable model directory; falls back to repo-local models/
+_MODEL_DIR = Path(os.environ.get("MODEL_DIR", "models"))
+DEFAULT_MODEL_PATH = _MODEL_DIR / "xgb_drift_model.json"
+DEFAULT_FEATURE_COLUMNS_PATH = _MODEL_DIR / "xgb_feature_columns.json"
+
+
+# ---------------------------------------------------------------------------
+# Azure Blob helpers for model artifacts
+# ---------------------------------------------------------------------------
+
+def _blob_configured() -> bool:
+    return bool(os.environ.get("AZURE_STORAGE_CONNECTION_STRING"))
+
+
+def _download_artifact_from_blob(blob_name: str) -> bytes | None:
+    """
+    Download a model artifact from Azure Blob Storage.
+
+    Returns raw bytes, or None if the blob does not exist.
+    Container is read from MODEL_ARTIFACTS_CONTAINER env var (default: ml-models).
+    """
+    try:
+        from azure.storage.blob import BlobServiceClient
+    except ImportError:
+        return None
+
+    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+    container = os.environ.get("MODEL_ARTIFACTS_CONTAINER", "ml-models")
+
+    client = BlobServiceClient.from_connection_string(connection_string)
+    blob_client = client.get_blob_client(container=container, blob=blob_name)
+
+    try:
+        data = blob_client.download_blob().readall()
+        logger.info("Downloaded artifact from blob: %s/%s", container, blob_name)
+        return data
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "blobnotfound" in msg or "not found" in msg:
+            return None
+        raise
+
+
+def upload_artifact_to_blob(local_path: Path, blob_name: str) -> None:
+    """
+    Upload a local model artifact file to Azure Blob Storage.
+    """
+    try:
+        from azure.storage.blob import BlobServiceClient
+    except ImportError as exc:
+        raise ImportError("azure-storage-blob is required for blob upload.") from exc
+
+    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+    container = os.environ.get("MODEL_ARTIFACTS_CONTAINER", "ml-models")
+
+    client = BlobServiceClient.from_connection_string(connection_string)
+    blob_client = client.get_blob_client(container=container, blob=blob_name)
+
+    with open(local_path, "rb") as f:
+        blob_client.upload_blob(f, overwrite=True)
+
+    logger.info("Uploaded artifact to blob: %s/%s", container, blob_name)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +160,10 @@ def load_xgb_model(
 ):
     """
     Load trained XGBoost drift model.
+
+    Resolution order:
+        1. Azure Blob Storage (when AZURE_STORAGE_CONNECTION_STRING is set)
+        2. Local model_path (repo-local models/ or MODEL_DIR override)
     """
 
     try:
@@ -106,6 +174,23 @@ def load_xgb_model(
         ) from exc
 
     model_path = Path(model_path)
+    blob_name = os.environ.get("XGB_MODEL_BLOB_NAME", "xgb_drift_model.json")
+
+    if _blob_configured():
+        data = _download_artifact_from_blob(blob_name)
+        if data is not None:
+            model = xgb.XGBRegressor()
+            # XGBoost load_model accepts a file-like only via a temp file path;
+            # write to a temp buffer path then load.
+            tmp = Path("/tmp/_xgb_model_tmp.json")
+            tmp.write_bytes(data)
+            model.load_model(str(tmp))
+            logger.info("Loaded XGBoost model from Azure Blob (%s)", blob_name)
+            return model
+        logger.warning(
+            "XGB model blob '%s' not found in Azure Blob; falling back to local path.",
+            blob_name,
+        )
 
     if not model_path.exists():
         raise FileNotFoundError(
@@ -115,6 +200,7 @@ def load_xgb_model(
 
     model = xgb.XGBRegressor()
     model.load_model(str(model_path))
+    logger.info("Loaded XGBoost model from local path: %s", model_path)
 
     return model
 
@@ -124,18 +210,33 @@ def load_feature_columns(
 ) -> list[str]:
     """
     Load feature column order used during XGBoost training.
+
+    Resolution order:
+        1. Azure Blob Storage (when AZURE_STORAGE_CONNECTION_STRING is set)
+        2. Local feature_columns_path
     """
 
     feature_columns_path = Path(feature_columns_path)
+    blob_name = os.environ.get(
+        "XGB_FEATURE_COLUMNS_BLOB_NAME", "xgb_feature_columns.json"
+    )
 
-    if not feature_columns_path.exists():
-        raise FileNotFoundError(
-            f"Feature column artifact not found: {feature_columns_path}. "
-            "Run: uv run python -m scripts.train_xgb_drift_model"
-        )
+    raw: bytes | None = None
 
-    with open(feature_columns_path, "r", encoding="utf-8") as f:
-        columns = json.load(f)
+    if _blob_configured():
+        raw = _download_artifact_from_blob(blob_name)
+        if raw is not None:
+            logger.info("Loaded feature columns from Azure Blob (%s)", blob_name)
+
+    if raw is None:
+        if not feature_columns_path.exists():
+            raise FileNotFoundError(
+                f"Feature column artifact not found: {feature_columns_path}. "
+                "Run: uv run python -m scripts.train_xgb_drift_model"
+            )
+        raw = feature_columns_path.read_bytes()
+
+    columns = json.loads(raw)
 
     if columns != FEATURE_COLUMNS:
         raise ValueError(
@@ -636,12 +737,14 @@ def simulate_xgb_garch_paths(
         drift = np.clip(drift, -drift_clip, drift_clip)
 
         if debug and step in {0, 20, 60, 120}:
-            print(
-                f"[xgb-garch-debug] step={step}, "
-                f"drift_mean={drift.mean():.5f}, "
-                f"drift_p10={np.percentile(drift, 10):.5f}, "
-                f"drift_p90={np.percentile(drift, 90):.5f}, "
-                f"sigma_mean={(np.sqrt(sigma2_pct).mean() / 100.0):.5f}"
+            logger.debug(
+                "xgb-garch step=%d drift_mean=%.5f drift_p10=%.5f "
+                "drift_p90=%.5f sigma_mean=%.5f",
+                step,
+                drift.mean(),
+                np.percentile(drift, 10),
+                np.percentile(drift, 90),
+                np.sqrt(sigma2_pct).mean() / 100.0,
             )
 
         # GARCH update in percent units.
@@ -733,14 +836,15 @@ def forecast_xgb_garch_t(
 
     garch_params = fit_garch_t_on_residuals(residuals)
 
-    print(
-        "[xgb-garch] fitted GARCH-t: "
-        f"omega={garch_params['omega']:.4f}, "
-        f"alpha={garch_params['alpha']:.4f}, "
-        f"beta={garch_params['beta']:.4f}, "
-        f"nu={garch_params['nu']:.2f}, "
-        f"persistence={garch_params['persistence']:.4f}, "
-        f"long_run_vol={garch_params['long_run_vol']:.4f}"
+    logger.info(
+        "fitted GARCH-t: omega=%.4f alpha=%.4f beta=%.4f nu=%.2f "
+        "persistence=%.4f long_run_vol=%.4f",
+        garch_params["omega"],
+        garch_params["alpha"],
+        garch_params["beta"],
+        garch_params["nu"],
+        garch_params["persistence"],
+        garch_params["long_run_vol"],
     )
 
     paths = simulate_xgb_garch_paths(

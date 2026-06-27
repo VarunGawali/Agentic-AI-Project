@@ -22,6 +22,8 @@ Phase 3:
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,12 @@ from pydantic import BaseModel, Field
 # Allow imports from project root when running from api/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("hedging_api")
 
 from data.loader import load_price_history as load_price_history_df
 
@@ -68,6 +76,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    logger.info("Hedging Assistant API starting up")
+    logger.info(
+        "Config: EIA_API_KEY=%s azure_blob=%s azure_openai=%s model_dir=%s",
+        "set" if os.environ.get("EIA_API_KEY") else "MISSING",
+        "set" if os.environ.get("AZURE_STORAGE_CONNECTION_STRING") else "not set",
+        "set" if os.environ.get("AZURE_OPENAI_API_KEY") else "not set",
+        os.environ.get("MODEL_DIR", "models"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -335,13 +355,71 @@ SCENARIOS = {
 @app.get("/health")
 def health() -> dict:
     """
-    Liveness probe.
+    Liveness probe — always returns 200 while the process is alive.
     """
+    return {"status": "ok", "service": "hedging-assistant-api"}
 
-    return {
-        "status": "ok",
-        "service": "hedging-assistant-api",
-    }
+
+@app.get("/ready")
+def ready() -> dict:
+    """
+    Readiness probe — checks that critical dependencies are reachable.
+
+    Returns 200 when all checks pass; 503 when any check fails.
+    """
+    from fastapi.responses import JSONResponse
+
+    checks: dict[str, str] = {}
+    ok = True
+
+    # Check 1: XGBoost model artifact resolvable
+    try:
+        from engines.xgb_garch_forecaster import (
+            DEFAULT_MODEL_PATH,
+            _blob_configured,
+            _download_artifact_from_blob,
+        )
+        blob_name = os.environ.get("XGB_MODEL_BLOB_NAME", "xgb_drift_model.json")
+        if _blob_configured():
+            data = _download_artifact_from_blob(blob_name)
+            checks["xgb_model"] = "blob_ok" if data is not None else "blob_missing"
+            if data is None:
+                ok = False
+        elif DEFAULT_MODEL_PATH.exists():
+            checks["xgb_model"] = "local_ok"
+        else:
+            checks["xgb_model"] = "missing"
+            ok = False
+    except Exception as exc:
+        checks["xgb_model"] = f"error: {exc}"
+        ok = False
+
+    # Check 2: Azure OpenAI configured (warn only — deterministic fallback available)
+    azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    if azure_key and azure_endpoint:
+        checks["azure_openai"] = "configured"
+    else:
+        checks["azure_openai"] = "not_configured (deterministic fallback active)"
+
+    # Check 3: EIA API key present
+    if os.environ.get("EIA_API_KEY"):
+        checks["eia_api_key"] = "present"
+    else:
+        checks["eia_api_key"] = "missing"
+        ok = False
+
+    # Check 4: Azure Blob Storage (optional)
+    if os.environ.get("AZURE_STORAGE_CONNECTION_STRING"):
+        checks["azure_blob"] = "configured"
+    else:
+        checks["azure_blob"] = "not_configured (local fallback active)"
+
+    status_code = 200 if ok else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "ready" if ok else "not_ready", "checks": checks},
+    )
 
 
 @app.post("/recommend")

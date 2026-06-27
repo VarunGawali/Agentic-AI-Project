@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
 try:
     import xgboost as xgb
@@ -35,9 +38,17 @@ except ImportError as exc:
 
 from hedging_assistant.data.loader import load_price_history
 from hedging_assistant.engines.features import FEATURE_COLUMNS, make_supervised_dataset
+from hedging_assistant.engines.xgb_garch_forecaster import upload_artifact_to_blob
 
+load_dotenv()
 
-MODEL_DIR = Path("models")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("train_xgb")
+
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", "models"))
 MODEL_PATH = MODEL_DIR / "xgb_drift_model.json"
 FEATURE_COLUMNS_PATH = MODEL_DIR / "xgb_feature_columns.json"
 METADATA_PATH = MODEL_DIR / "xgb_training_metadata.json"
@@ -118,9 +129,12 @@ def save_artifacts(
     model: xgb.XGBRegressor,
     feature_columns: list[str],
     metadata: dict,
+    upload: bool = False,
 ) -> None:
     """
-    Save trained model, feature columns, and metadata.
+    Save trained model, feature columns, and metadata locally.
+    When upload=True (and AZURE_STORAGE_CONNECTION_STRING is set),
+    all three artifacts are also pushed to Azure Blob Storage.
     """
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,10 +147,27 @@ def save_artifacts(
     with open(METADATA_PATH, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    print("\n[train] Saved artifacts")
-    print(f"[train] Model           : {MODEL_PATH}")
-    print(f"[train] Feature columns : {FEATURE_COLUMNS_PATH}")
-    print(f"[train] Metadata        : {METADATA_PATH}")
+    logger.info("Saved artifacts locally")
+    logger.info("  Model           : %s", MODEL_PATH)
+    logger.info("  Feature columns : %s", FEATURE_COLUMNS_PATH)
+    logger.info("  Metadata        : %s", METADATA_PATH)
+
+    if upload:
+        if not os.environ.get("AZURE_STORAGE_CONNECTION_STRING"):
+            logger.warning(
+                "--upload requested but AZURE_STORAGE_CONNECTION_STRING is not set; skipping."
+            )
+            return
+
+        for local_path, blob_name_env, default_blob in [
+            (MODEL_PATH, "XGB_MODEL_BLOB_NAME", "xgb_drift_model.json"),
+            (FEATURE_COLUMNS_PATH, "XGB_FEATURE_COLUMNS_BLOB_NAME", "xgb_feature_columns.json"),
+            (METADATA_PATH, "XGB_METADATA_BLOB_NAME", "xgb_training_metadata.json"),
+        ]:
+            blob_name = os.environ.get(blob_name_env, default_blob)
+            upload_artifact_to_blob(local_path, blob_name)
+
+        logger.info("All artifacts uploaded to Azure Blob Storage.")
 
 
 def rmse(
@@ -215,31 +246,38 @@ def parse_args() -> argparse.Namespace:
         help="Rows to drop at beginning due to rolling features.",
     )
 
+    parser.add_argument(
+        "--upload",
+        action="store_true",
+        default=False,
+        help="Upload trained artifacts to Azure Blob Storage after saving.",
+    )
+
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    print("[train] Loading price history...")
+    logger.info("Loading price history...")
     df = load_price_history(
         symbol=args.symbol,
         start=args.start,
     )
 
-    print(f"[train] Rows loaded : {len(df)}")
-    print(f"[train] Date range  : {df['date'].min()} to {df['date'].max()}")
+    logger.info("Rows loaded : %d", len(df))
+    logger.info("Date range  : %s to %s", df["date"].min(), df["date"].max())
 
-    print("[train] Building supervised dataset...")
+    logger.info("Building supervised dataset...")
     X, y, target_df = make_supervised_dataset(
         df=df,
         inventory_csv=args.inventory_csv,
         warmup=args.warmup,
     )
 
-    print(f"[train] Feature matrix shape : {X.shape}")
-    print(f"[train] Target shape         : {y.shape}")
-    print(f"[train] Feature columns      : {list(X.columns)}")
+    logger.info("Feature matrix shape : %s", X.shape)
+    logger.info("Target shape         : %s", y.shape)
+    logger.info("Feature columns      : %s", list(X.columns))
 
     missing_cols = set(FEATURE_COLUMNS) - set(X.columns)
 
@@ -248,7 +286,7 @@ def main() -> None:
 
     X = X[FEATURE_COLUMNS]
 
-    print("[train] Training XGBoost drift model...")
+    logger.info("Training XGBoost drift model...")
     model, metrics = train_xgb_model(
         X=X,
         y=y,
@@ -281,18 +319,17 @@ def main() -> None:
         model=model,
         feature_columns=FEATURE_COLUMNS,
         metadata=metadata,
+        upload=args.upload,
     )
 
-    print("\n[train] Metrics")
-    print("---------------")
-
+    logger.info("Metrics")
     for key, value in metrics.items():
         if isinstance(value, float):
-            print(f"{key}: {value:.6f}")
+            logger.info("  %s: %.6f", key, value)
         else:
-            print(f"{key}: {value}")
+            logger.info("  %s: %s", key, value)
 
-    print("\n[train] Done.")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
