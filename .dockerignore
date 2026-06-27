@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+*.env
+
+# Dev / test artifacts
+.joblib_cache/
+benchmarks/
+scripts/test_*.py
+
+# Frontend build artifacts (built inside Docker)
+frontend/node_modules/
+frontend/dist/
+
+# Git
+.git/
+.github/
+
+# Docs
+*.md

@@ -28,7 +28,9 @@ Optional environment variables:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from typing import Any
 
 from openai import AzureOpenAI
@@ -36,6 +38,8 @@ from openai import AzureOpenAI
 import numpy as np
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
+
+logger = logging.getLogger(__name__)
 
 from hedging_assistant.contracts import (
     PriceHistory,
@@ -119,39 +123,64 @@ def _get_llm():
         return client
 
     except Exception as exc:
-        print(f"[langgraph_agent] LLM init failed ({exc}); deterministic fallback.")
+        logger.warning("LLM init failed (%s); deterministic fallback active.", exc)
         return None
     
 def _llm_invoke(
     client,
     prompt: str,
     max_tokens: int = 512,
+    max_retries: int = 3,
 ) -> str:
     """
-    Invoke Azure OpenAI chat completion using official OpenAI SDK.
+    Invoke Azure OpenAI chat completion with exponential-backoff retry.
 
-    Uses the deployment name from AZURE_OPENAI_DEPLOYMENT.
+    Retries on transient errors (rate limits, server errors).
+    Raises on non-retryable errors (auth, bad request).
     """
+    from openai import RateLimitError, APIStatusError, APIConnectionError
 
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
 
-    response = client.chat.completions.create(
-        model=deployment,
-        temperature=0.0,
-        max_tokens=max_tokens,
-        messages=[
-            {
-                "role": "system",
-                "content": LLM_SYSTEM_INSTRUCTIONS,
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-    )
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=deployment,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": LLM_SYSTEM_INSTRUCTIONS},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content.strip()
 
-    return response.choices[0].message.content.strip()
+        except RateLimitError as exc:
+            wait = 2 ** attempt
+            logger.warning("Azure OpenAI rate limit; retrying in %ds (attempt %d/%d).", wait, attempt + 1, max_retries)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+            else:
+                raise
+
+        except APIStatusError as exc:
+            if exc.status_code and exc.status_code >= 500:
+                wait = 2 ** attempt
+                logger.warning("Azure OpenAI server error %d; retrying in %ds.", exc.status_code, wait)
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                    continue
+            raise
+
+        except APIConnectionError as exc:
+            wait = 2 ** attempt
+            logger.warning("Azure OpenAI connection error; retrying in %ds.", wait)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+            else:
+                raise
+
+    raise RuntimeError("LLM invocation failed after all retries.")
 
 # ---------------------------------------------------------------------------
 # State schema
@@ -374,7 +403,7 @@ def node_assess(state: AgentState) -> dict:
             msg_prefix = "[node_assess/LLM]"
 
         except Exception as exc:
-            print(f"[node_assess] LLM failed ({exc}); deterministic fallback.")
+            logger.warning("node_assess: LLM failed (%s); deterministic fallback.", exc)
             msg_prefix = "[node_assess/det]"
     else:
         msg_prefix = "[node_assess/det]"
@@ -391,7 +420,7 @@ def node_assess(state: AgentState) -> dict:
         f"{[strategy.value for strategy in strategy_types]}."
     )
 
-    print(msg)
+    logger.info("%s", msg)
 
     return {
         "candidates": candidates,
@@ -428,7 +457,7 @@ def node_forecast(state: AgentState) -> dict:
         f"{forecast_obj.horizon} steps using {forecast_obj.model_name}."
     )
 
-    print(msg)
+    logger.info("%s", msg)
 
     return {
         "forecast_obj": forecast_obj,
@@ -474,7 +503,7 @@ def node_explore(state: AgentState) -> dict:
     except Exception as exc:
         lp_msg = f"[node_explore] CVaR-LP skipped: {exc}"
 
-    print(lp_msg)
+    logger.info("%s", lp_msg)
 
     # ---------------------------------------------------------
     # No-hedge baseline
@@ -540,7 +569,7 @@ def node_explore(state: AgentState) -> dict:
         f"No-hedge mean cost=${no_hedge_cost.mean:,.0f}."
     )
 
-    print(msg)
+    logger.info("%s", msg)
 
     return {
         "candidates": candidates,
@@ -632,7 +661,7 @@ def node_arbitrate(state: AgentState) -> dict:
                 )
 
         except Exception as exc:
-            print(f"[node_arbitrate] LLM failed ({exc}); deterministic fallback.")
+            logger.warning("node_arbitrate: LLM failed (%s); deterministic fallback.", exc)
             best = None
 
     if best is None:
@@ -650,7 +679,7 @@ def node_arbitrate(state: AgentState) -> dict:
             record.note = record.note + " | Accepted as best candidate."
             break
 
-    print(msg)
+    logger.info("%s", msg)
 
     return {
         "best": best,
@@ -713,7 +742,7 @@ def node_explain(state: AgentState) -> dict:
             msg = "[node_explain/LLM] LLM-written rationale."
 
         except Exception as exc:
-            print(f"[node_explain] LLM failed ({exc}); deterministic fallback.")
+            logger.warning("node_explain: LLM failed (%s); deterministic fallback.", exc)
             rationale = ""
 
     if not rationale:
@@ -768,7 +797,7 @@ def node_explain(state: AgentState) -> dict:
         },
     )
 
-    print(msg)
+    logger.info("%s", msg)
 
     return {
         "recommendation": recommendation,

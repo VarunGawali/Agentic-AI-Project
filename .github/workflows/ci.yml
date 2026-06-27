@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check no bare print() in source (excluding scripts/ and __main__ blocks)
+        run: |
+          # Fail if any print() call remains in api/, engines/, agent/, data/ (not __main__)
+          grep -rn "^\s*print(" api/ engines/ agent/ data/ \
+            --include="*.py" \
+            | grep -v "if __name__" \
+            && echo "Bare print() found — use logging instead" && exit 1 \
+            || echo "No bare print() found in source modules."
+
+      - name: Import smoke test
+        run: |
+          python -c "
+          from contracts import PriceHistory, ExposureBook, RiskAppetite
+          from engines.forecaster import forecast
+          print('Imports OK')
+          "
+        env:
+          PYTHONPATH: .
+
+  build-api:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API Docker image
+        run: docker build -t hedging-api:ci .
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build frontend Docker image
+        run: |
+          docker build \
+            --build-arg VITE_API_BASE_URL=http://localhost:8000 \
+            -t hedging-frontend:ci \
+            ./frontend

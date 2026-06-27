@@ -20,6 +20,9 @@ Notes:
 
 from __future__ import annotations
 
+import logging
+import os
+import tempfile
 from importlib import import_module
 from pathlib import Path
 
@@ -33,12 +36,17 @@ from scipy.stats import qmc
 
 from hedging_assistant.contracts import PriceHistory, PriceForecast
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # joblib cache setup
 # ---------------------------------------------------------------------------
 
-_CACHE_DIR = str(Path(__file__).parent.parent / ".joblib_cache")
+# Use JOBLIB_CACHE_DIR env var so cloud deployments can point to a writable
+# ephemeral volume (e.g. /tmp or a mounted Azure Files share).
+# Falls back to a system temp directory to avoid polluting the repo root.
+_default_cache = str(Path(tempfile.gettempdir()) / "hedging_joblib_cache")
+_CACHE_DIR = os.environ.get("JOBLIB_CACHE_DIR", _default_cache)
 _memory = joblib.Memory(location=_CACHE_DIR, verbose=0)
 
 
@@ -419,9 +427,9 @@ def _forecast_impl(
         )
 
         if regime_prob is not None:
-            print(f"[forecaster] Regime: {regime_label} (p={regime_prob:.2f})")
+            logger.info("Regime: %s (p=%.2f)", regime_label, regime_prob)
         else:
-            print(f"[forecaster] Regime not applied: {regime_label}")
+            logger.info("Regime not applied: %s", regime_label)
 
     distribution = distribution.lower()
 
@@ -444,7 +452,7 @@ def _forecast_impl(
             seed=seed,
         )
 
-        print(f"[forecaster] Student-t shocks enabled, df={student_t_df:.2f}")
+        logger.info("Student-t shocks enabled, df=%.2f", student_t_df)
 
     start_price = float(series.iloc[-1])
 
@@ -566,10 +574,10 @@ def forecast(
     if use_cache:
         cached_fn = _memory.cache(_forecast_impl)
         result = cached_fn(*args)
-        print("[forecaster] Cache enabled.")
+        logger.debug("Forecast served from joblib cache.")
     else:
         result = _forecast_impl(*args)
-        print("[forecaster] Cache disabled — computed fresh paths.")
+        logger.debug("Forecast computed fresh (cache disabled).")
 
     if use_regime and distribution == "student-t":
         model_name = "GBM-Sobol-Antithetic-HMM-t"

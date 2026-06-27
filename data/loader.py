@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,34 @@ try:
     from azure.storage.blob import BlobServiceClient
 except ImportError:
     BlobServiceClient = None
+
+try:
+    from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+except ImportError:
+    DefaultAzureCredential = None
+    ManagedIdentityCredential = None
+
+
+def _make_retry_session(
+    total: int = 4,
+    backoff_factor: float = 1.0,
+    status_forcelist: tuple = (429, 500, 502, 503, 504),
+) -> requests.Session:
+    """
+    Build a requests.Session with automatic retry on transient errors.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=total,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 load_dotenv()
@@ -144,11 +174,12 @@ def fetch_eia_price_data(
     start: str,
 ) -> pd.DataFrame:
     """
-    Fetch EIA crude price data using pagination.
+    Fetch EIA crude price data using pagination with automatic retry.
     """
 
     series_id = SERIES[symbol.upper()]
     all_rows = []
+    session = _make_retry_session()
 
     offset = 0
     page_size = 5000
@@ -166,7 +197,7 @@ def fetch_eia_price_data(
             "offset": offset,
         }
 
-        response = requests.get(EIA_BASE, params=params, timeout=30)
+        response = session.get(EIA_BASE, params=params, timeout=30)
         response.raise_for_status()
 
         rows = response.json().get("response", {}).get("data", [])
@@ -268,16 +299,23 @@ def _get_blob_client(symbol: str):
             "azure-storage-blob is not installed. Add it to requirements.txt."
         )
 
-    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
     container_name = os.environ.get("BLOB_CONTAINER_NAME", "market-data")
     blob_name = os.environ.get(
         f"{symbol.upper()}_BLOB_NAME",
         f"{symbol.lower()}_price_history.csv",
     )
 
-    blob_service_client = BlobServiceClient.from_connection_string(
-        connection_string
-    )
+    # Prefer Managed Identity / DefaultAzureCredential when AZURE_STORAGE_ACCOUNT_URL
+    # is set. Falls back to connection string for local dev.
+    account_url = os.environ.get("AZURE_STORAGE_ACCOUNT_URL")
+    if account_url and DefaultAzureCredential is not None:
+        credential = DefaultAzureCredential()
+        blob_service_client = BlobServiceClient(account_url=account_url, credential=credential)
+        logger.debug("Blob client using DefaultAzureCredential (managed identity).")
+    else:
+        connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        logger.debug("Blob client using connection string.")
 
     return blob_service_client.get_blob_client(
         container=container_name,

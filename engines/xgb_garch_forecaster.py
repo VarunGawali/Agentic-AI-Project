@@ -46,6 +46,30 @@ def _blob_configured() -> bool:
     return bool(os.environ.get("AZURE_STORAGE_CONNECTION_STRING"))
 
 
+def _make_artifact_blob_service_client():
+    """
+    Build BlobServiceClient for model artifacts.
+
+    Prefers Managed Identity (AZURE_STORAGE_ACCOUNT_URL) over connection string.
+    """
+    try:
+        from azure.storage.blob import BlobServiceClient as _BSC
+    except ImportError as exc:
+        raise ImportError("azure-storage-blob is required.") from exc
+
+    account_url = os.environ.get("AZURE_STORAGE_ACCOUNT_URL")
+    if account_url:
+        try:
+            from azure.identity import DefaultAzureCredential
+            credential = DefaultAzureCredential()
+            logger.debug("Artifact blob client using DefaultAzureCredential.")
+            return _BSC(account_url=account_url, credential=credential)
+        except ImportError:
+            pass  # fall through to connection string
+
+    return _BSC.from_connection_string(os.environ["AZURE_STORAGE_CONNECTION_STRING"])
+
+
 def _download_artifact_from_blob(blob_name: str) -> bytes | None:
     """
     Download a model artifact from Azure Blob Storage.
@@ -54,14 +78,11 @@ def _download_artifact_from_blob(blob_name: str) -> bytes | None:
     Container is read from MODEL_ARTIFACTS_CONTAINER env var (default: ml-models).
     """
     try:
-        from azure.storage.blob import BlobServiceClient
+        client = _make_artifact_blob_service_client()
     except ImportError:
         return None
 
-    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
     container = os.environ.get("MODEL_ARTIFACTS_CONTAINER", "ml-models")
-
-    client = BlobServiceClient.from_connection_string(connection_string)
     blob_client = client.get_blob_client(container=container, blob=blob_name)
 
     try:
@@ -79,15 +100,8 @@ def upload_artifact_to_blob(local_path: Path, blob_name: str) -> None:
     """
     Upload a local model artifact file to Azure Blob Storage.
     """
-    try:
-        from azure.storage.blob import BlobServiceClient
-    except ImportError as exc:
-        raise ImportError("azure-storage-blob is required for blob upload.") from exc
-
-    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+    client = _make_artifact_blob_service_client()
     container = os.environ.get("MODEL_ARTIFACTS_CONTAINER", "ml-models")
-
-    client = BlobServiceClient.from_connection_string(connection_string)
     blob_client = client.get_blob_client(container=container, blob=blob_name)
 
     with open(local_path, "rb") as f:
