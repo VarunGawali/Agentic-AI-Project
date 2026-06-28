@@ -360,6 +360,23 @@ input[type="range"]::-webkit-slider-thumb:hover {
   background: var(--yellow);
 }
 
+.model-option.disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.model-option.disabled:hover {
+  background: transparent;
+}
+
+.model-badge {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--white-dim);
+  opacity: 0.5;
+  letter-spacing: 0.03em;
+}
+
 /* Sidebar footer */
 .sidebar-footer {
   margin-top: auto;

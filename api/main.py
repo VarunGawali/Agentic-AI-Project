@@ -495,10 +495,14 @@ def recommend(req: RecommendRequest) -> dict:
             symbol="WTI",
         )
 
+        _period_label = {"D": "day", "W": "week", "M": "month"}.get(
+            req.frequency.upper(), "month"
+        )
+
         exposure = make_exposure_book(
             barrels_per_period=req.barrels_per_period,
             horizon=req.horizon,
-            period_label="month",
+            period_label=_period_label,
         )
 
         risk = RiskAppetite(

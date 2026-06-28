@@ -525,21 +525,31 @@ def forecast(
         )
 
     # -----------------------------------------------------------------------
-    # Phase 3 forecaster: XGB-GARCH-t
+    # Phase 3 forecaster: XGB-GARCH-t (monthly only — trained on 21-day periods)
+    # For daily/weekly frequency, fall through to student-t GBM.
     # -----------------------------------------------------------------------
 
+    _DAILY_STEPS = {"D": 1, "W": 5, "M": 21}
+
     if model == "xgb-garch-t":
-        return forecast_xgb_garch_t(
-            history=history,
-            horizon=horizon,
-            n_paths=n_paths,
-            seed=seed,
-            calibration_window=calibration_window or 1000,
-            daily_steps=21,
-            drift_scale=0.25,
-            drift_clip=0.01,
-            debug=False,
-        )
+        if frequency != "M":
+            logger.warning(
+                "xgb-garch-t is trained for monthly periods; "
+                "frequency=%s — routing to student-t GBM instead.", frequency
+            )
+            model = "student-t"
+        else:
+            return forecast_xgb_garch_t(
+                history=history,
+                horizon=horizon,
+                n_paths=n_paths,
+                seed=seed,
+                calibration_window=calibration_window or 1000,
+                daily_steps=_DAILY_STEPS["M"],
+                drift_scale=0.25,
+                drift_clip=0.01,
+                debug=False,
+            )
 
     # -----------------------------------------------------------------------
     # Legacy GBM fallback / benchmark path

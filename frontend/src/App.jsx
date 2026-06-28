@@ -122,18 +122,25 @@ export default function App() {
 
   const handleModelChange = useCallback(
     (model) => {
-      const next = {
-        ...params,
-        model,
-      }
-
+      const next = { ...params, model }
       setParams(next)
-
       clearTimeout(debounceRef.current)
+      debounceRef.current = setTimeout(() => runAll(next), 400)
+    },
+    [params, runAll],
+  )
 
-      debounceRef.current = setTimeout(() => {
-        runAll(next)
-      }, 400)
+  const handleFrequencyChange = useCallback(
+    (frequency) => {
+      // xgb-garch-t is monthly-only; switch model automatically
+      const model =
+        frequency === 'M' ? 'xgb-garch-t' : 'student-t'
+      // Reset horizon to a sensible default for the new granularity
+      const horizonDefaults = { D: 20, W: 12, M: 6 }
+      const next = { ...params, frequency, model, horizon: horizonDefaults[frequency] }
+      setParams(next)
+      clearTimeout(debounceRef.current)
+      debounceRef.current = setTimeout(() => runAll(next), 400)
     },
     [params, runAll],
   )
@@ -284,7 +291,7 @@ export default function App() {
           />
 
           <Slider
-            label="Exposure (bbl/mo)"
+            label={`Exposure (bbl/${params.frequency === 'D' ? 'day' : params.frequency === 'W' ? 'wk' : 'mo'})`}
             value={params.barrels_per_period}
             min={10000}
             max={500000}
@@ -294,12 +301,20 @@ export default function App() {
           />
 
           <Slider
-            label="Horizon (months)"
+            label={
+              params.frequency === 'D' ? 'Horizon (days)' :
+              params.frequency === 'W' ? 'Horizon (weeks)' :
+              'Horizon (months)'
+            }
             value={params.horizon}
-            min={1}
-            max={12}
+            min={params.frequency === 'D' ? 5 : 1}
+            max={params.frequency === 'D' ? 60 : params.frequency === 'W' ? 52 : 24}
             step={1}
-            fmt={v => `${v} mo`}
+            fmt={v =>
+              params.frequency === 'D' ? `${v} d` :
+              params.frequency === 'W' ? `${v} wk` :
+              `${v} mo`
+            }
             onChange={v => handleSliderChange('horizon', v)}
           />
 
@@ -348,34 +363,56 @@ export default function App() {
           />
 
           <div className="sidebar-section-title" style={{ marginTop: 4 }}>
+            Frequency
+          </div>
+
+          <div className="model-toggle">
+            {[
+              { key: 'D', label: 'Daily' },
+              { key: 'W', label: 'Weekly' },
+              { key: 'M', label: 'Monthly' },
+            ].map(({ key, label }) => (
+              <div
+                key={key}
+                className={`model-option ${params.frequency === key ? 'active' : ''}`}
+                onClick={() => handleFrequencyChange(key)}
+              >
+                <div className="model-dot" />
+                {label}
+              </div>
+            ))}
+          </div>
+
+          <div className="sidebar-section-title" style={{ marginTop: 4 }}>
             Model
           </div>
 
           <div className="model-toggle">
-            {['xgb-garch-t', 'normal', 'student-t', 'hmm'].map(m => (
-              <div
-                key={m}
-                className={`model-option ${params.model === m ? 'active' : ''}`}
-                onClick={() => handleModelChange(m)}
-              >
-                <div className="model-dot" />
-                {
-                  {
-                    'xgb-garch-t': 'XGB + GARCH-t',
-                    normal: 'GBM Normal',
-                    'student-t': 'GBM Student-t',
-                    hmm: 'GBM + HMM Regime',
-                  }[m]
-                }
-              </div>
-            ))}
+            {[
+              { key: 'xgb-garch-t', label: 'XGB + GARCH-t', monthlyOnly: true },
+              { key: 'student-t', label: 'GBM Student-t', monthlyOnly: false },
+            ].map(({ key, label, monthlyOnly }) => {
+              const disabled = monthlyOnly && params.frequency !== 'M'
+              return (
+                <div
+                  key={key}
+                  className={`model-option ${params.model === key ? 'active' : ''} ${disabled ? 'disabled' : ''}`}
+                  onClick={() => !disabled && handleModelChange(key)}
+                  title={disabled ? 'Only available for monthly frequency' : undefined}
+                >
+                  <div className="model-dot" />
+                  {label}
+                  {monthlyOnly && <span className="model-badge">M only</span>}
+                </div>
+              )
+            })}
           </div>
 
           <div className="sidebar-footer">
             <div className="run-config-box">
               paths: <span>{params.n_paths.toLocaleString()}</span>
               <br />
-              freq: <span>Monthly</span>
+              freq: <span>{{ D: 'Daily', W: 'Weekly', M: 'Monthly' }[params.frequency]}</span>
               <br />
               seed: <span>42</span>
               <br />
