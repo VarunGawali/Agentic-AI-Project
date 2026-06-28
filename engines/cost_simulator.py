@@ -65,13 +65,10 @@ def _bootstrap_ci(
         raise ValueError("alpha must be between 0 and 1")
 
     rng = np.random.default_rng(seed)
-    boot_stats = np.empty(n_boot, dtype=float)
     n = len(costs)
-
-    for i in range(n_boot):
-        sample_idx = rng.choice(n, size=n, replace=True)
-        sample = costs[sample_idx]
-        boot_stats[i] = statistic_fn(sample)
+    # Draw all bootstrap indices at once — one vectorised call instead of n_boot loops.
+    all_idx = rng.integers(0, n, size=(n_boot, n))
+    boot_stats = np.array([statistic_fn(costs[idx]) for idx in all_idx], dtype=float)
 
     lo = float(np.percentile(boot_stats, (1 - alpha) / 2 * 100))
     hi = float(np.percentile(boot_stats, (1 + alpha) / 2 * 100))

@@ -98,12 +98,23 @@ Important rules:
 """
 
 
+_LLM_CLIENT = None
+_LLM_INIT_ATTEMPTED = False
+
+
 def _get_llm():
     """
-    Initialize Azure OpenAI client only if env vars are configured.
+    Return a module-level Azure OpenAI client, initialising it once per process.
 
-    If anything fails, return None and use deterministic fallback.
+    Subsequent calls return the cached client (or None if init failed/not configured).
     """
+
+    global _LLM_CLIENT, _LLM_INIT_ATTEMPTED
+
+    if _LLM_INIT_ATTEMPTED:
+        return _LLM_CLIENT
+
+    _LLM_INIT_ATTEMPTED = True
 
     key = os.getenv("AZURE_OPENAI_API_KEY")
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -114,17 +125,16 @@ def _get_llm():
     try:
         from openai import AzureOpenAI
 
-        client = AzureOpenAI(
+        _LLM_CLIENT = AzureOpenAI(
             azure_endpoint=endpoint,
             api_key=key,
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
         )
 
-        return client
-
     except Exception as exc:
         logger.warning("LLM init failed (%s); deterministic fallback active.", exc)
-        return None
+
+    return _LLM_CLIENT
     
 def _llm_invoke(
     client,
@@ -539,6 +549,7 @@ def node_explore(state: AgentState) -> dict:
         candidates=candidates,
         mode="accurate",
         compute_ci=False,
+        no_hedge_cost=no_hedge_cost,
     )
 
     records = []

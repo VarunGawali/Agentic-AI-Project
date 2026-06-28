@@ -26,6 +26,7 @@ Phase 3:
 
 from __future__ import annotations
 
+import concurrent.futures
 import numpy as np
 
 from hedging_assistant.contracts import (
@@ -291,6 +292,8 @@ def evaluate_candidates(
     compute_ci: bool = False,
     candidates: list[StrategyParams] | None = None,
     execution_cost_per_barrel: float = 0.05,
+    no_hedge_cost: "CostDistribution | None" = None,
+    n_jobs: int = 4,
 ) -> list[dict]:
     """
     Evaluate hedge candidates and return ranked results.
@@ -316,24 +319,25 @@ def evaluate_candidates(
         raise ValueError("risk.max_hedge must be between 0 and 1")
 
     # ---------------------------------------------------------
-    # 1. No-hedge baseline
+    # 1. No-hedge baseline (skip if caller already computed it)
     # ---------------------------------------------------------
 
-    no_hedge_params = StrategyParams(
-        strategy_type=StrategyType.STAGGERED,
-        base_fraction=0.0,
-        cap=risk.max_hedge,
-    )
+    if no_hedge_cost is None:
+        no_hedge_params = StrategyParams(
+            strategy_type=StrategyType.STAGGERED,
+            base_fraction=0.0,
+            cap=risk.max_hedge,
+        )
 
-    no_hedge_cost = simulate_cost(
-        forecast_obj=forecast_obj,
-        exposure=exposure,
-        params=no_hedge_params,
-        forward_price=forward_price,
-        cvar_alpha=risk.cvar_alpha,
-        mode="optimized",
-        compute_ci=False,
-    )
+        no_hedge_cost = simulate_cost(
+            forecast_obj=forecast_obj,
+            exposure=exposure,
+            params=no_hedge_params,
+            forward_price=forward_price,
+            cvar_alpha=risk.cvar_alpha,
+            mode="optimized",
+            compute_ci=False,
+        )
 
     # ---------------------------------------------------------
     # 2. Generate candidates if not supplied
@@ -371,9 +375,7 @@ def evaluate_candidates(
     # 3. Simulate + score candidates
     # ---------------------------------------------------------
 
-    results: list[dict] = []
-
-    for params in candidates:
+    def _eval_one(params: StrategyParams) -> dict:
         cost_dist = simulate_cost(
             forecast_obj=forecast_obj,
             exposure=exposure,
@@ -394,15 +396,17 @@ def evaluate_candidates(
             execution_cost_per_barrel=execution_cost_per_barrel,
         )
 
-        results.append(
-            {
-                "hedge_ratio": float(params.base_fraction),
-                "strategy_type": params.strategy_type.value,
-                "params": params,
-                "cost": cost_dist,
-                "score": score,
-            }
-        )
+        return {
+            "hedge_ratio": float(params.base_fraction),
+            "strategy_type": params.strategy_type.value,
+            "params": params,
+            "cost": cost_dist,
+            "score": score,
+        }
+
+    workers = max(1, min(n_jobs, len(candidates)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_eval_one, candidates))
 
     results.sort(key=lambda item: item["score"].blended)
 

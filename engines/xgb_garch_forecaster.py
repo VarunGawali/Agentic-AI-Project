@@ -37,6 +37,9 @@ _MODEL_DIR = Path(os.environ.get("MODEL_DIR", "models"))
 DEFAULT_MODEL_PATH = _MODEL_DIR / "xgb_drift_model.json"
 DEFAULT_FEATURE_COLUMNS_PATH = _MODEL_DIR / "xgb_feature_columns.json"
 
+# Module-level model cache — loaded once per process, reused across requests.
+_MODEL_CACHE: dict = {}
+
 
 # ---------------------------------------------------------------------------
 # Azure Blob helpers for model artifacts
@@ -178,7 +181,14 @@ def load_xgb_model(
     Resolution order:
         1. Azure Blob Storage (when AZURE_STORAGE_CONNECTION_STRING is set)
         2. Local model_path (repo-local models/ or MODEL_DIR override)
+
+    The loaded model is cached in _MODEL_CACHE for the process lifetime so
+    subsequent requests pay no I/O cost.
     """
+
+    cache_key = str(model_path)
+    if cache_key in _MODEL_CACHE:
+        return _MODEL_CACHE[cache_key]
 
     try:
         import xgboost as xgb
@@ -200,6 +210,7 @@ def load_xgb_model(
             tmp.write_bytes(data)
             model.load_model(str(tmp))
             logger.info("Loaded XGBoost model from Azure Blob (%s)", blob_name)
+            _MODEL_CACHE[cache_key] = model
             return model
         logger.warning(
             "XGB model blob '%s' not found in Azure Blob; falling back to local path.",
@@ -215,6 +226,7 @@ def load_xgb_model(
     model = xgb.XGBRegressor()
     model.load_model(str(model_path))
     logger.info("Loaded XGBoost model from local path: %s", model_path)
+    _MODEL_CACHE[cache_key] = model
 
     return model
 

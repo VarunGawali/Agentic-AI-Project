@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,28 @@ from contracts import (
 
 from agent.langgraph_workflow import run_agent
 from engines.cost_simulator import simulate_cost
+
+# ---------------------------------------------------------------------------
+# Price history cache — refreshed at most once per hour to avoid repeated
+# file/network I/O on every slider change.
+# ---------------------------------------------------------------------------
+_PRICE_CACHE: dict = {"df": None, "ts": 0.0}
+_PRICE_CACHE_TTL = int(os.environ.get("PRICE_CACHE_TTL_SECONDS", "3600"))
+
+
+def _get_price_history() -> "pd.DataFrame":
+    now = time.monotonic()
+    if _PRICE_CACHE["df"] is not None and (now - _PRICE_CACHE["ts"]) < _PRICE_CACHE_TTL:
+        return _PRICE_CACHE["df"]
+    df = load_price_history_df(symbol="WTI")
+    df["date"] = pd.to_datetime(df["date"])
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df.dropna(subset=["date", "price"])
+    df = df[df["price"] > 0].sort_values("date")
+    _PRICE_CACHE["df"] = df
+    _PRICE_CACHE["ts"] = now
+    logger.info("Price history refreshed (%d rows).", len(df))
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -464,13 +487,7 @@ def recommend(req: RecommendRequest) -> dict:
     """
 
     try:
-        df = load_price_history_df(symbol="WTI")
-
-        df["date"] = pd.to_datetime(df["date"])
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-        df = df.dropna(subset=["date", "price"])
-        df = df[df["price"] > 0]
-        df = df.sort_values("date")
+        df = _get_price_history()
 
         history = PriceHistory(
             dates=df["date"].to_numpy(),
@@ -638,13 +655,7 @@ def stress_test(req: StressRequest) -> dict:
     """
 
     try:
-        df = load_price_history_df(symbol="WTI")
-
-        df["date"] = pd.to_datetime(df["date"])
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-        df = df.dropna(subset=["date", "price"])
-        df = df[df["price"] > 0]
-        df = df.sort_values("date")
+        df = _get_price_history()
 
         history = PriceHistory(
             dates=df["date"].to_numpy(),
