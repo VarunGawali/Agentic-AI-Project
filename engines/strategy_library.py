@@ -17,7 +17,10 @@ Notes:
 
 from __future__ import annotations
 
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from hedging_assistant.contracts import (
     StrategyType,
@@ -567,10 +570,9 @@ def build_dp_table(
 
         value_next = value_curr
 
-    print(
-        f"[strategy_library] DP table built: "
-        f"{horizon} periods x {N_STATES} states. "
-        f"long_run_vol={long_run_vol:.4f}"
+    logger.info(
+        "[strategy_library] DP table built: %d periods x %d states. long_run_vol=%.4f",
+        horizon, N_STATES, long_run_vol,
     )
 
     return policy

@@ -25,8 +25,11 @@ Target for training:
 """
 
 from __future__ import annotations
+import logging
 
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -158,13 +161,13 @@ def load_inventory_feature(
     path = Path(inventory_csv)
 
     if not path.exists():
-        print(f"[features] Inventory CSV not found: {path}. Using zeros.")
+        logger.warning("[features] Inventory CSV not found: %s. Using zeros.", path)
         return np.zeros(len(dates), dtype=float)
 
     inventory_df = pd.read_csv(path)
 
     if "date" not in inventory_df.columns:
-        print("[features] Inventory CSV missing 'date'. Using zeros.")
+        logger.warning("[features] Inventory CSV missing 'date'. Using zeros.")
         return np.zeros(len(dates), dtype=float)
 
     possible_value_columns = [
@@ -181,7 +184,7 @@ def load_inventory_feature(
             break
 
     if value_col is None:
-        print("[features] Inventory CSV missing inventory value column. Using zeros.")
+        logger.warning("[features] Inventory CSV missing inventory value column. Using zeros.")
         return np.zeros(len(dates), dtype=float)
 
     inventory_df["date"] = pd.to_datetime(inventory_df["date"], errors="coerce")

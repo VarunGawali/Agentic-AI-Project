@@ -16,7 +16,10 @@ Environment variables (all optional):
   AZURE_OPENAI_API_VERSION  API version (default: 2024-02-01)
 """
 from __future__ import annotations
+import logging
 import os, json
+
+logger = logging.getLogger(__name__)
 from typing import Any
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
@@ -45,7 +48,7 @@ def _get_llm():
             temperature=0.0, max_tokens=512,
         )
     except Exception as e:
-        print(f"[langgraph_agent] LLM init failed ({e}); deterministic fallback.")
+        logger.warning("[langgraph_agent] LLM init failed (%s); deterministic fallback.", e)
         return None
 
 # ---------------------------------------------------------------------------
@@ -104,19 +107,19 @@ def node_assess(state: AgentState) -> AgentState:
             candidates = [StrategyParams(strategy_type=StrategyType.STAGGERED, base_fraction=f) for f in fracs]
             msg = f"[node_assess/LLM] {len(candidates)} candidates: {[f'{c.base_fraction:.0%}' for c in candidates]}"
         except Exception as e:
-            print(f"[node_assess] LLM failed ({e}); fallback.")
+            logger.warning("[node_assess] LLM failed (%s); fallback.", e)
             candidates = None
     if candidates is None:
         candidates = generate_staggered_candidates(max_hedge=risk.max_hedge, n_steps=11, cap=risk.max_hedge)
         msg = f"[node_assess/det] {len(candidates)} staggered candidates."
-    print(msg)
+    logger.info(msg)
     return {"candidates": candidates, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 
 def node_forecast(state: AgentState) -> AgentState:
     fc = forecast(state["history"], state["exposure"].horizon, seed=0)
     msg = f"[node_forecast] {fc.n_paths} paths × {fc.horizon} steps ({fc.model_name})."
-    print(msg)
+    logger.info(msg)
     return {"forecast_obj": fc, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 
@@ -126,7 +129,7 @@ def node_explore(state: AgentState) -> AgentState:
     results = evaluate_candidates(forecast_obj=fc, exposure=exposure, risk=risk, forward_price=fwd)
     records = [CandidateRecord(params=r["params"], score=r["score"], accepted=False) for r in results]
     msg = f"[node_explore] {len(records)} candidates. No-hedge: ${no_hedge_cost.mean:,.0f}."
-    print(msg)
+    logger.info(msg)
     return {"records": records, "no_hedge_cost": no_hedge_cost, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 
@@ -158,13 +161,13 @@ def node_arbitrate(state: AgentState) -> AgentState:
                 reason = reason_line.replace("REASON:", "").strip() if reason_line else ""
                 msg = f"[node_arbitrate/LLM] idx={idx} ({best.params.base_fraction:.0%}). {reason}"
         except Exception as e:
-            print(f"[node_arbitrate] LLM failed ({e}); fallback.")
+            logger.warning("[node_arbitrate] LLM failed (%s); fallback.", e)
             best = None
     if best is None:
         best = min(records, key=lambda r: r.score.blended)
         msg = f"[node_arbitrate/det] {best.params.base_fraction:.0%}, blended={best.score.blended:,.0f}."
     best.accepted = True
-    print(msg)
+    logger.info(msg)
     return {"best": best, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 
@@ -195,7 +198,7 @@ def node_explain(state: AgentState) -> AgentState:
             rationale = llm.invoke(prompt).content.strip()
             msg = "[node_explain/LLM] LLM-written rationale."
         except Exception as e:
-            print(f"[node_explain] LLM failed ({e}); fallback.")
+            logger.warning("[node_explain] LLM failed (%s); fallback.", e)
             rationale = ""
     if not rationale:
         rationale = (
@@ -209,7 +212,7 @@ def node_explain(state: AgentState) -> AgentState:
         policy=policy, cost=cost, score=best.score, rationale=rationale, trace=records,
         assumptions={"forward_price": fwd, "model": fc.model_name},
     )
-    print(msg)
+    logger.info(msg)
     return {"recommendation": rec, "llm_rationale": rationale, "trace_messages": state.get("trace_messages", []) + [msg]}
 
 # ---------------------------------------------------------------------------

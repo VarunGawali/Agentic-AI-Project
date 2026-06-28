@@ -31,9 +31,12 @@ Notes:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from hedging_assistant.contracts import (
     PriceForecast,
@@ -530,12 +533,10 @@ def tune_strategy_params(
     best["strategy_type"] = strategy_type.value
     best["n_trials"] = int(n_trials)
 
-    print(
-        f"[optimizer] Optuna {strategy_type.value}: "
-        f"{n_trials} trials -> "
-        f"base_fraction={best['base_fraction']:.2%}, "
-        f"cap={best['cap']:.2%}, "
-        f"score={best['best_score']:,.2f}"
+    logger.info(
+        "[optimizer] Optuna %s: %d trials -> base_fraction=%.2f%%, cap=%.2f%%, score=%.2f",
+        strategy_type.value, n_trials,
+        best["base_fraction"] * 100, best["cap"] * 100, best["best_score"],
     )
 
     return best
