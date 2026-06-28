@@ -28,6 +28,7 @@ from hedging_assistant.contracts import (
     HedgingPolicy,
     PriceForecast,
 )
+from hedging_assistant.engines.utils import resolve_forward_curve
 
 
 # ---------------------------------------------------------------------------
@@ -361,48 +362,6 @@ def apply_strategy(
 
 
 # ---------------------------------------------------------------------------
-# Forward price helper for DP
-# ---------------------------------------------------------------------------
-
-def _resolve_forward_curve(
-    forward_price,
-    horizon: int,
-) -> np.ndarray:
-    """
-    Resolve scalar/list/ForwardCurve-like object into forward curve array.
-
-    Supported:
-        - scalar float
-        - list/np.ndarray shape (horizon,)
-        - object with .prices
-    """
-
-    if np.isscalar(forward_price):
-        if float(forward_price) <= 0:
-            raise ValueError("forward_price must be positive")
-
-        return np.full(horizon, float(forward_price), dtype=float)
-
-    if hasattr(forward_price, "prices"):
-        fwd = np.asarray(forward_price.prices, dtype=float)
-    else:
-        fwd = np.asarray(forward_price, dtype=float)
-
-    if fwd.ndim != 1:
-        raise ValueError("forward curve must be 1D")
-
-    if len(fwd) != horizon:
-        raise ValueError(
-            f"forward curve length {len(fwd)} does not match horizon {horizon}"
-        )
-
-    if np.any(fwd <= 0):
-        raise ValueError("forward curve prices must be positive")
-
-    return fwd
-
-
-# ---------------------------------------------------------------------------
 # DP table builder
 # ---------------------------------------------------------------------------
 
@@ -459,7 +418,7 @@ def build_dp_table(
     if not 0 < cvar_alpha < 1:
         raise ValueError("cvar_alpha must be between 0 and 1")
 
-    fwd = _resolve_forward_curve(forward_price, horizon)
+    fwd = resolve_forward_curve(forward_price, horizon)
 
     actions = np.linspace(0.0, max_hedge, n_actions)
     n_actions_actual = len(actions)

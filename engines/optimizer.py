@@ -45,48 +45,7 @@ from hedging_assistant.contracts import (
     StrategyParams,
     StrategyType,
 )
-
-
-# ---------------------------------------------------------------------------
-# Shared helper
-# ---------------------------------------------------------------------------
-
-def _resolve_forward_curve(
-    forward_price,
-    horizon: int,
-) -> np.ndarray:
-    """
-    Convert scalar/list/ForwardCurve-like object into a forward curve array.
-
-    Supported:
-        - scalar float
-        - list / np.ndarray of shape (horizon,)
-        - object with .prices
-    """
-
-    if np.isscalar(forward_price):
-        if float(forward_price) <= 0:
-            raise ValueError(f"forward_price must be positive; got {forward_price}")
-
-        return np.full(horizon, float(forward_price), dtype=float)
-
-    if hasattr(forward_price, "prices"):
-        fwd = np.asarray(forward_price.prices, dtype=float)
-    else:
-        fwd = np.asarray(forward_price, dtype=float)
-
-    if fwd.ndim != 1:
-        raise ValueError("forward curve must be a 1D array")
-
-    if len(fwd) != horizon:
-        raise ValueError(
-            f"forward curve length {len(fwd)} does not match horizon {horizon}"
-        )
-
-    if np.any(fwd <= 0):
-        raise ValueError("forward curve prices must all be positive")
-
-    return fwd
+from hedging_assistant.engines.utils import resolve_forward_curve
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +157,7 @@ def optimize_cvar_lp(
     if not 0 <= max_hedge <= 1:
         raise ValueError("max_hedge must be between 0 and 1")
 
-    fwd = _resolve_forward_curve(
+    fwd = resolve_forward_curve(
         forward_price=forward_price,
         horizon=horizon,
     )

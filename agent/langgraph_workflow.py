@@ -1141,7 +1141,6 @@ def _build_graph() -> Any:
     builder.add_node("forecast", node_forecast)
     builder.add_node("market_intel", node_market_intel)
     builder.add_node("assess", node_assess)
-    builder.add_node("explore_dispatch", node_explore_dispatch)
     builder.add_node("evaluate_family", node_evaluate_family)
     builder.add_node("explore_collect", node_explore_collect)
     builder.add_node("arbitrate", node_arbitrate)
@@ -1155,15 +1154,8 @@ def _build_graph() -> Any:
     builder.add_edge("forecast", "assess")
     builder.add_edge("market_intel", "assess")
 
-    # assess → fan-out dispatch
-    builder.add_edge("assess", "explore_dispatch")
-
-    # Fan-out: dispatch → evaluate_family (via Send, so conditional edges)
-    builder.add_conditional_edges(
-        "explore_dispatch",
-        lambda state: state,   # identity — actual routing done by Send objects returned by node
-        ["evaluate_family"],
-    )
+    # Fan-out: assess → evaluate_family via Send (node_explore_dispatch is the routing fn)
+    builder.add_conditional_edges("assess", node_explore_dispatch, ["evaluate_family"])
 
     # Fan-in: each evaluate_family → collect
     builder.add_edge("evaluate_family", "explore_collect")
