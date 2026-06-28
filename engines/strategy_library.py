@@ -806,14 +806,24 @@ def generate_batch_candidates(
     max_hedge: float = 1.0,
     n_steps: int = 5,
     cap: float = 1.0,
+    param_hints: dict | None = None,
 ) -> list:
     """
     Generate candidates across multiple strategy types.
+
+    param_hints: optional dict of narrowed parameter ranges from market intelligence.
+        Supported keys:
+            trigger_thresholds: list[float]
+            vol_scale_ks:       list[float]
+            trigger_base_fractions: list[float]
+            hybrid_trigger_thresholds: list[float]
+            hybrid_vol_scale_ks: list[float]
     """
 
     if strategy_types is None:
         strategy_types = [StrategyType.STAGGERED]
 
+    hints = param_hints or {}
     all_candidates: list[StrategyParams] = []
 
     for strategy_type in strategy_types:
@@ -831,6 +841,8 @@ def generate_batch_candidates(
                 generate_trigger_candidates(
                     max_hedge=max_hedge,
                     cap=cap,
+                    trigger_thresholds=hints.get("trigger_thresholds"),
+                    base_fractions=hints.get("trigger_base_fractions"),
                 )
             )
 
@@ -839,6 +851,7 @@ def generate_batch_candidates(
                 generate_volatility_candidates(
                     max_hedge=max_hedge,
                     cap=cap,
+                    vol_scale_ks=hints.get("vol_scale_ks"),
                 )
             )
 
@@ -847,6 +860,8 @@ def generate_batch_candidates(
                 generate_hybrid_candidates(
                     max_hedge=max_hedge,
                     cap=cap,
+                    trigger_thresholds=hints.get("hybrid_trigger_thresholds"),
+                    vol_scale_ks=hints.get("hybrid_vol_scale_ks"),
                 )
             )
 
