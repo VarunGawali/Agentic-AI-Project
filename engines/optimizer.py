@@ -97,25 +97,40 @@ def optimize_cvar_lp(
     cvar_alpha: float = 0.95,
     cost_weight: float = 1.0,
     cvar_weight: float = 1.0,
+    opportunity_weight: float = 0.0,
+    execution_weight: float = 0.0,
+    execution_cost_per_barrel: float = 0.05,
     max_hedge: float = 1.0,
     solver: str | None = None,
 ) -> np.ndarray:
     """
-    Solve for optimal per-period hedge fractions using CVaR-LP.
+    Solve for optimal per-period hedge fractions using a 4-factor LP.
 
     Decision variables:
         f : hedge fraction per period, shape (H,)
-        z : VaR threshold
-        u : tail excess per scenario, shape (N,)
+        z : VaR threshold (CVaR linearization)
+        u : tail excess per scenario, shape (N,)   [CVaR slack]
+        r : regret per scenario, shape (N,)        [opportunity cost slack]
 
     Objective:
-        minimize cost_weight * mean_cost + cvar_weight * CVaR
+        minimize  cost_weight      * mean_cost
+                + cvar_weight      * CVaR_alpha
+                + opportunity_weight * mean_regret
+                + execution_weight * execution_risk
 
-    CVaR linearization:
+    CVaR linearization (Rockafellar-Uryasev):
         CVaR_alpha = z + 1 / ((1 - alpha) * N) * sum(u)
-
         u_i >= total_cost_i - z
         u_i >= 0
+
+    Opportunity cost linearization:
+        regret_i  = max(total_cost_i - no_hedge_cost_i, 0)
+        r_i >= total_cost_i - no_hedge_cost_i
+        r_i >= 0
+        mean_regret = (1/N) * sum(r)
+
+    Execution risk (linear in f):
+        execution_risk = sum_t(f_t * volume_t) * execution_cost_per_barrel
 
     total_cost_i(f):
         sum_t volume_t * [f_t * forward_t + (1 - f_t) * spot_i_t]
@@ -168,6 +183,15 @@ def optimize_cvar_lp(
     if cvar_weight < 0:
         raise ValueError("cvar_weight cannot be negative")
 
+    if opportunity_weight < 0:
+        raise ValueError("opportunity_weight cannot be negative")
+
+    if execution_weight < 0:
+        raise ValueError("execution_weight cannot be negative")
+
+    if execution_cost_per_barrel < 0:
+        raise ValueError("execution_cost_per_barrel cannot be negative")
+
     if not 0 <= max_hedge <= 1:
         raise ValueError("max_hedge must be between 0 and 1")
 
@@ -179,7 +203,8 @@ def optimize_cvar_lp(
     # Decision variables
     f = cp.Variable(horizon, name="hedge_fractions")
     z = cp.Variable(name="var_threshold")
-    u = cp.Variable(n_paths, name="tail_excess")
+    u = cp.Variable(n_paths, name="tail_excess")   # CVaR slack
+    r = cp.Variable(n_paths, name="regret")         # opportunity cost slack
 
     # total_cost_i(f)
     # = sum_t volume_t * [f_t * fwd_t + (1 - f_t) * spot_i_t]
@@ -197,14 +222,28 @@ def optimize_cvar_lp(
 
     total_costs = A @ f + b                  # affine expression, shape (N,)
 
+    # No-hedge cost per scenario (constant — no decision variable involved)
+    no_hedge_costs = vol_path.sum(axis=1)    # shape (N,) — pure spot exposure
+
     mean_cost = cp.sum(total_costs) / n_paths
 
     cvar_cost = z + (
         1.0 / ((1.0 - cvar_alpha) * n_paths)
     ) * cp.sum(u)
 
+    # Opportunity cost: mean regret across scenarios where hedging
+    # turned out more expensive than doing nothing.
+    # r_i >= total_cost_i - no_hedge_cost_i, r_i >= 0
+    mean_regret = cp.sum(r) / n_paths
+
+    # Execution risk: total hedged volume × cost per barrel (linear in f)
+    execution_risk = float(execution_cost_per_barrel) * (volumes @ f)
+
     objective = cp.Minimize(
-        cost_weight * mean_cost + cvar_weight * cvar_cost
+        cost_weight      * mean_cost
+        + cvar_weight      * cvar_cost
+        + opportunity_weight * mean_regret
+        + execution_weight   * execution_risk
     )
 
     constraints = [
@@ -212,6 +251,8 @@ def optimize_cvar_lp(
         f <= max_hedge,
         u >= 0,
         u >= total_costs - z,
+        r >= 0,
+        r >= total_costs - no_hedge_costs,
     ]
 
     problem = cp.Problem(objective, constraints)
@@ -300,12 +341,15 @@ def optimize_cvar_lp_params(
     cvar_alpha: float = 0.95,
     cost_weight: float = 1.0,
     cvar_weight: float = 1.0,
+    opportunity_weight: float = 0.0,
+    execution_weight: float = 0.0,
+    execution_cost_per_barrel: float = 0.05,
     max_hedge: float = 1.0,
     solver: str | None = None,
 ) -> StrategyParams:
     """
     Convenience wrapper:
-        optimize CVaR-LP fractions
+        optimize 4-factor LP fractions
         convert them directly into StrategyParams(strategy_type=CVAR_LP)
     """
 
@@ -316,6 +360,9 @@ def optimize_cvar_lp_params(
         cvar_alpha=cvar_alpha,
         cost_weight=cost_weight,
         cvar_weight=cvar_weight,
+        opportunity_weight=opportunity_weight,
+        execution_weight=execution_weight,
+        execution_cost_per_barrel=execution_cost_per_barrel,
         max_hedge=max_hedge,
         solver=solver,
     )

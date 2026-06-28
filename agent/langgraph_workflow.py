@@ -493,6 +493,8 @@ def node_explore(state: AgentState) -> dict:
             cvar_alpha=risk.cvar_alpha,
             cost_weight=risk.w_cost,
             cvar_weight=risk.w_cvar,
+            opportunity_weight=risk.w_opportunity,
+            execution_weight=risk.w_execution,
             max_hedge=risk.max_hedge,
         )
 
