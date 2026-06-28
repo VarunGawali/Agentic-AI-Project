@@ -3,7 +3,7 @@ import axios from 'axios'
 import './App.css'
 
 import FanChart from './components/FanChart'
-import CostHistogram from './components/CostHistogram'
+import RiskRewardChart from './components/RiskRewardChart'
 import HedgeSchedule from './components/HedgeSchedule'
 import StressChart from './components/StressChart'
 import CandidateTable from './components/CandidateTable'
@@ -197,7 +197,7 @@ export default function App() {
             </div>
 
             <div className="card chart-card">
-              <div className="card-title">Cost Distribution</div>
+              <div className="card-title">Strategy Risk-Reward</div>
 
               <div className="chart-wrapper">
                 {loading && (
@@ -206,10 +206,10 @@ export default function App() {
                   </div>
                 )}
 
-                {rec?.cost_histogram ? (
-                  <CostHistogram data={rec.cost_histogram} />
+                {rec?.candidates?.length ? (
+                  <RiskRewardChart candidates={rec.candidates} />
                 ) : (
-                  <EmptyState icon="📊" text="Run model to see cost distribution" />
+                  <EmptyState icon="🎯" text="Run model to see strategy comparison" />
                 )}
               </div>
             </div>
