@@ -12,6 +12,7 @@ import {
 
 export default function HedgeSchedule({ data, schedule }) {
   const policySchedule = schedule ?? data?.policy_schedule
+  const periodCosts = data?.period_costs
 
   if (!policySchedule?.length) {
     return (
@@ -26,7 +27,11 @@ export default function HedgeSchedule({ data, schedule }) {
     period: `M${i + 1}`,
     hedged_pct: Math.round(Number(frac) * 100),
     unhedged_pct: Math.round((1 - Number(frac)) * 100),
+    hedged_cost: periodCosts?.hedged_cost?.[i] ?? null,
+    no_hedge_cost: periodCosts?.no_hedge_cost?.[i] ?? null,
   }))
+
+  const hasCosts = Boolean(periodCosts?.hedged_cost?.length)
 
   const CustomTooltip = ({ active, payload, label }) => {
     if (!active || !payload?.length) return null
@@ -59,7 +64,7 @@ export default function HedgeSchedule({ data, schedule }) {
       <ResponsiveContainer width="100%" height={280}>
         <ComposedChart
           data={chartData}
-          margin={{ top: 8, right: 10, left: -10, bottom: 0 }}
+          margin={{ top: 8, right: hasCosts ? 40 : 10, left: -10, bottom: 0 }}
         >
           <CartesianGrid
             strokeDasharray="3 3"
@@ -82,6 +87,18 @@ export default function HedgeSchedule({ data, schedule }) {
             domain={[0, 100]}
             width={36}
           />
+
+          {hasCosts && (
+            <YAxis
+              yAxisId="cost"
+              orientation="right"
+              tick={{ fill: '#555', fontSize: 10 }}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={v => `$${v}M`}
+              width={44}
+            />
+          )}
 
           <Tooltip content={<CustomTooltip />} />
 
@@ -121,6 +138,34 @@ export default function HedgeSchedule({ data, schedule }) {
             legendType="none"
             unit="%"
           />
+
+          {hasCosts && (
+            <Line
+              yAxisId="cost"
+              dataKey="hedged_cost"
+              stroke="#4caf7d"
+              dot={{ fill: '#4caf7d', r: 3 }}
+              strokeWidth={1.5}
+              strokeDasharray="4 3"
+              name="Hedged Cost"
+              unit="M"
+              connectNulls
+            />
+          )}
+
+          {hasCosts && (
+            <Line
+              yAxisId="cost"
+              dataKey="no_hedge_cost"
+              stroke="#e05c5c"
+              dot={{ fill: '#e05c5c', r: 3 }}
+              strokeWidth={1.5}
+              strokeDasharray="4 3"
+              name="No-Hedge Cost"
+              unit="M"
+              connectNulls
+            />
+          )}
         </ComposedChart>
       </ResponsiveContainer>
     </div>

@@ -227,7 +227,7 @@ export default function App() {
                 )}
 
                 {rec?.policy_schedule ? (
-                  <HedgeSchedule schedule={rec.policy_schedule} />
+                  <HedgeSchedule data={rec} schedule={rec.policy_schedule} />
                 ) : (
                   <EmptyState icon="📅" text="Run model to see hedge schedule" />
                 )}

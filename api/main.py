@@ -210,6 +210,34 @@ def _build_fan_data(paths: np.ndarray) -> dict:
     }
 
 
+def _build_period_costs(
+    forecast_obj,
+    hedge_fractions: np.ndarray,
+    volumes: np.ndarray,
+    forward_price: float,
+) -> dict:
+    """
+    Build median per-period hedged and no-hedge costs in millions.
+
+    Returns:
+        dict with hedged_cost and no_hedge_cost lists, one value per period.
+    """
+
+    paths = np.asarray(forecast_obj.paths, dtype=float)
+    n_paths, horizon = paths.shape
+
+    fwd = np.full(horizon, float(forward_price))
+    fracs = np.asarray(hedge_fractions, dtype=float)
+
+    hedged_per_period = (fracs * volumes * fwd) + ((1 - fracs) * volumes * np.median(paths, axis=0))
+    no_hedge_per_period = volumes * np.median(paths, axis=0)
+
+    return {
+        "hedged_cost":   [round(float(v) / 1e6, 3) for v in hedged_per_period],
+        "no_hedge_cost": [round(float(v) / 1e6, 3) for v in no_hedge_per_period],
+    }
+
+
 def _build_histogram(values: np.ndarray, bins: int = 40) -> dict:
     """
     Build histogram for dashboard plotting.
@@ -547,6 +575,18 @@ def recommend(req: RecommendRequest) -> dict:
                 "cvar_line": round(recommendation.cost.cvar / 1e6, 2),
             }
 
+        period_costs = None
+        if forecast_obj is not None:
+            try:
+                period_costs = _build_period_costs(
+                    forecast_obj=forecast_obj,
+                    hedge_fractions=recommendation.policy.hedge_fractions,
+                    volumes=exposure.volumes,
+                    forward_price=req.forward_price,
+                )
+            except Exception:
+                period_costs = None
+
         return {
             "rationale": recommendation.rationale,
             "hedge_fraction": round(
@@ -578,6 +618,7 @@ def recommend(req: RecommendRequest) -> dict:
                 "ci_cvar": _safe_ci(ci_cvar),
             },
             "cost_histogram": cost_histogram,
+            "period_costs": period_costs,
             "history": {
                 "dates": hist_dates,
                 "prices": hist_tail,
