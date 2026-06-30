@@ -28,6 +28,7 @@ from pathlib import Path
 
 import joblib
 from hedging_assistant.engines.xgb_garch_forecaster import forecast_xgb_garch_t
+from hedging_assistant.engines.ml_vol_forecaster import forecast_ml_vol_t
 import numpy as np
 import pandas as pd
 import scipy.stats
@@ -519,36 +520,39 @@ def forecast(
     if n_paths <= 0:
         raise ValueError("n_paths must be greater than 0.")
 
-    if model not in {"xgb-garch-t", "gbm", "normal", "student-t"}:
+    if model not in {"xgb-garch-t", "xgb-vol-t", "ml-vol-t", "gbm", "normal", "student-t"}:
         raise ValueError(
-            "model must be one of: 'xgb-garch-t', 'gbm', 'normal', 'student-t'."
+            "model must be one of: 'xgb-garch-t', 'xgb-vol-t', 'gbm', 'normal', "
+            "'student-t'."
         )
 
     # -----------------------------------------------------------------------
-    # Phase 3 forecaster: XGB-GARCH-t (monthly only — trained on 21-day periods)
-    # For daily/weekly frequency, fall through to student-t GBM.
+    # XGB-Vol-t forecaster: ML predicts VOLATILITY (the forecastable signal);
+    # prices are simulated driftless. Replaces the legacy XGB-GARCH-t drift
+    # model, which pointed ML at price direction (unforecastable) and produced
+    # a biased mean + vacuous intervals. The "xgb-garch-t" id is kept as an
+    # alias so existing configs/UI keep working.
+    # Operates on daily history; daily/weekly procurement still routes to the
+    # student-t GBM baseline.
     # -----------------------------------------------------------------------
 
     _DAILY_STEPS = {"D": 1, "W": 5, "M": 21}
 
-    if model == "xgb-garch-t":
+    if model in {"xgb-garch-t", "xgb-vol-t", "ml-vol-t"}:
         if frequency != "M":
             logger.warning(
-                "xgb-garch-t is trained for monthly periods; "
+                "xgb-vol-t targets monthly procurement (21-day periods); "
                 "frequency=%s — routing to student-t GBM instead.", frequency
             )
             model = "student-t"
         else:
-            return forecast_xgb_garch_t(
+            return forecast_ml_vol_t(
                 history=history,
                 horizon=horizon,
                 n_paths=n_paths,
                 seed=seed,
-                calibration_window=calibration_window or 1000,
+                calibration_window=calibration_window or 1500,
                 daily_steps=_DAILY_STEPS["M"],
-                drift_scale=0.25,
-                drift_clip=0.01,
-                debug=False,
             )
 
     # -----------------------------------------------------------------------
