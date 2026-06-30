@@ -78,7 +78,7 @@ from hedging_assistant.engines.strategy_library import (
     generate_batch_candidates,
 )
 from hedging_assistant.engines.cost_simulator import simulate_cost
-from hedging_assistant.engines.scorer import evaluate_candidates, score_policy
+from hedging_assistant.engines.scorer import evaluate_candidates, blend_scores
 
 
 # ---------------------------------------------------------------------------
@@ -879,8 +879,8 @@ def node_explore_collect(state: AgentState) -> dict:
         compute_ci=False,
     )
 
-    # --- Sort by blended score ---
-    all_results.sort(key=lambda item: item["score"].blended)
+    # --- Pool-level normalize + blend, then sort (magnitude-invariant ranking) ---
+    all_results = blend_scores(all_results, risk)
 
     records = []
     for item in all_results:
@@ -891,7 +891,7 @@ def node_explore_collect(state: AgentState) -> dict:
             f"Strategy={params.strategy_type.value}; "
             f"mean=${cost.mean:,.0f}; CVaR=${cost.cvar:,.0f}; "
             f"opp=${score.opportunity_cost:,.0f}; exec=${score.execution_risk:,.0f}; "
-            f"blended=${score.blended:,.0f}"
+            f"blended_idx={score.blended:.3f}"
         )
         records.append(CandidateRecord(params=params, score=score, accepted=False, note=note))
 
@@ -953,20 +953,14 @@ def node_arbitrate(state: AgentState) -> dict:
                     w_opportunity=max(0.0, risk.w_opportunity + w_opp_boost),
                 )
 
-                # Re-score with adjusted weights
-                no_hedge_cost = state.get("no_hedge_cost")
-                rescored = []
-                for item in results:
-                    new_score = score_policy(
-                        cost=item["cost"],
-                        no_hedge_cost=no_hedge_cost,
-                        params=item["params"],
-                        risk=adjusted_risk,
-                        exposure=state["exposure"],
-                        forecast_obj=state["forecast_obj"],
-                    )
-                    rescored.append({**item, "score": new_score})
-                rescored.sort(key=lambda x: x["score"].blended)
+                # Re-blend with adjusted weights on copied score objects so the
+                # original (collected) ranking is not mutated. Raw factors are
+                # weight-independent; only the normalization weights change.
+                rescored = [
+                    {**item, "score": dataclasses.replace(item["score"])}
+                    for item in results
+                ]
+                rescored = blend_scores(rescored, adjusted_risk)
                 scoring_note = (
                     f"weights adjusted: w_cvar={adjusted_risk.w_cvar:.2f} "
                     f"(+{w_cvar_boost:.2f}), w_opp={adjusted_risk.w_opportunity:.2f} "
@@ -976,8 +970,10 @@ def node_arbitrate(state: AgentState) -> dict:
                 rescored = results
                 scoring_note = "weights unchanged"
 
-            # Step 2 — LLM picks winner from re-scored table
-            rows = ["idx | strategy | hedge% | mean$M | CVaR$M | opp$M | exec$M | blended$M"]
+            # Step 2 — LLM picks winner from re-scored table.
+            # Raw factors shown in $M for context; blendIdx is the unitless
+            # normalized multi-criteria score actually used for ranking (lower=better).
+            rows = ["idx | strategy | hedge% | mean$M | CVaR$M | opp$M | exec$M | blendIdx"]
             for idx, item in enumerate(rescored):
                 p = item["params"]
                 s = item["score"]
@@ -986,7 +982,7 @@ def node_arbitrate(state: AgentState) -> dict:
                     f"{_selected_hedge_fraction(p):6.0%} | "
                     f"{s.cost/1e6:7.2f} | {s.cvar/1e6:7.2f} | "
                     f"{s.opportunity_cost/1e6:7.2f} | {s.execution_risk/1e6:7.2f} | "
-                    f"{s.blended/1e6:7.2f}"
+                    f"{s.blended:8.3f}"
                 )
 
             prompt = (
@@ -1029,7 +1025,7 @@ def node_arbitrate(state: AgentState) -> dict:
         best = results[0]
         msg = (
             f"[node_arbitrate/det] {_strategy_display(best['params'])}, "
-            f"score={best['score'].blended:,.0f}."
+            f"blendIdx={best['score'].blended:.3f}."
         )
 
     best_params = best["params"]

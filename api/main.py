@@ -576,7 +576,7 @@ def recommend(req: RecommendRequest) -> dict:
                     "cvar": round(record.score.cvar / 1e6, 2),
                     "opportunity_cost": round(record.score.opportunity_cost / 1e6, 2),
                     "execution_risk": round(record.score.execution_risk / 1e6, 2),
-                    "blended": round(record.score.blended / 1e6, 2),
+                    "blended": round(record.score.blended, 4),
                     "accepted": bool(record.accepted),
                     "note": record.note,
                 }

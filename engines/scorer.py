@@ -241,13 +241,17 @@ def score_policy(
         Score =
             w_cost * Expected Cost
           + w_cvar * CVaR
-          + w_opportunity * Opportunity Cost (normalized by baseline)
+          + w_opportunity * Opportunity Cost
           + w_execution * Execution Risk
 
     Lower blended score is better.
-    Opportunity cost is normalized by no-hedge mean cost so it contributes
-    as a fractional penalty rather than a raw dollar amount, preventing it
-    from dominating in regimes where forward > E[spot].
+
+    NOTE: the `blended` set here is a provisional raw-dollar weighted sum used
+    only as a fallback ordering for callers that do not normalize. The
+    authoritative, magnitude-invariant ranking is produced by `blend_scores()`,
+    which min-max normalizes each factor across the candidate pool. Whenever a
+    full pool is available (the agent workflow, the API) call `blend_scores()`
+    so no single factor dominates purely because of its dollar scale.
     """
 
     cost_factor = float(cost.mean)
@@ -265,15 +269,10 @@ def score_policy(
         execution_cost_per_barrel=execution_cost_per_barrel,
     )
 
-    # Normalize opportunity cost by baseline so it is a fraction of no-hedge cost.
-    # This prevents it from dominating when forward > E[spot] (contango regime).
-    baseline_mean = abs(float(no_hedge_cost.mean)) if no_hedge_cost is not None else 1.0
-    opp_normalized = opportunity_cost / baseline_mean if baseline_mean > 0 else 0.0
-
     blended = (
         risk.w_cost * cost_factor
         + risk.w_cvar * cvar_factor
-        + risk.w_opportunity * opp_normalized * cost_factor
+        + risk.w_opportunity * opportunity_cost
         + risk.w_execution * execution_risk
     )
 
@@ -284,6 +283,76 @@ def score_policy(
         execution_risk=execution_risk,
         blended=float(blended),
     )
+
+
+# ---------------------------------------------------------------------------
+# Pool-level normalization + blend
+# ---------------------------------------------------------------------------
+
+def blend_scores(
+    results: list[dict],
+    risk: RiskAppetite,
+    eps: float = 1e-9,
+) -> list[dict]:
+    """
+    Normalize the four factors across the candidate pool, then blend.
+
+    Each raw factor (cost, cvar, opportunity_cost, execution_risk) is min-max
+    scaled to [0, 1] over the whole candidate set, so no factor dominates the
+    blended score purely because of dollar magnitude. The blended score becomes
+    a unitless multi-criteria index in [0, sum(weights)] — lower is better:
+
+        blended = w_cost*cost_n + w_cvar*cvar_n
+                + w_opportunity*opp_n + w_execution*exec_n
+
+    A factor that is constant across all candidates (zero spread) contributes 0,
+    so it cannot tip the decision either way.
+
+    Mutates each item["score"] in place (fills the *_norm fields and `blended`)
+    and returns the pool sorted ascending by blended.
+    """
+    if not results:
+        return results
+
+    factor_attrs = ("cost", "cvar", "opportunity_cost", "execution_risk")
+    norm_attrs = {
+        "cost": "cost_norm",
+        "cvar": "cvar_norm",
+        "opportunity_cost": "opportunity_norm",
+        "execution_risk": "execution_norm",
+    }
+    weight_for = {
+        "cost": risk.w_cost,
+        "cvar": risk.w_cvar,
+        "opportunity_cost": risk.w_opportunity,
+        "execution_risk": risk.w_execution,
+    }
+
+    raw = {
+        attr: np.array(
+            [float(getattr(item["score"], attr)) for item in results],
+            dtype=float,
+        )
+        for attr in factor_attrs
+    }
+
+    norm = {}
+    for attr in factor_attrs:
+        vals = raw[attr]
+        lo = float(vals.min())
+        hi = float(vals.max())
+        span = hi - lo
+        norm[attr] = (vals - lo) / span if span > eps else np.zeros_like(vals)
+
+    for i, item in enumerate(results):
+        score = item["score"]
+        for attr in factor_attrs:
+            setattr(score, norm_attrs[attr], float(norm[attr][i]))
+        score.blended = float(
+            sum(weight_for[attr] * norm[attr][i] for attr in factor_attrs)
+        )
+
+    return sorted(results, key=lambda item: item["score"].blended)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +373,7 @@ def evaluate_candidates(
     n_jobs: int = 4,
     price_history: "np.ndarray | None" = None,
     long_run_vol: "float | None" = None,
+    normalize: bool = False,
 ) -> list[dict]:
     """
     Evaluate hedge candidates and return ranked results.
@@ -419,6 +489,12 @@ def evaluate_candidates(
     workers = max(1, min(n_jobs, len(candidates)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(_eval_one, candidates))
+
+    if normalize:
+        # Single-call pool == full candidate set, so normalize here.
+        # In the fan-out agent workflow this is left False and blend_scores()
+        # is applied once after the per-family results are merged.
+        return blend_scores(results, risk)
 
     results.sort(key=lambda item: item["score"].blended)
 

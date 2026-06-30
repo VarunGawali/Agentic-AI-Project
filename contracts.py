@@ -467,12 +467,24 @@ class FactorScore:
     execution_risk: float
     blended: float = 0.0
 
+    # Pool-normalized components in [0, 1] (filled by scorer.blend_scores).
+    # These make the four factors comparable regardless of dollar magnitude;
+    # `blended` becomes the weighted sum of these, i.e. a unitless index.
+    cost_norm: float = 0.0
+    cvar_norm: float = 0.0
+    opportunity_norm: float = 0.0
+    execution_norm: float = 0.0
+
     def __post_init__(self):
         self.cost = float(self.cost)
         self.cvar = float(self.cvar)
         self.opportunity_cost = float(self.opportunity_cost)
         self.execution_risk = float(self.execution_risk)
         self.blended = float(self.blended)
+        self.cost_norm = float(self.cost_norm)
+        self.cvar_norm = float(self.cvar_norm)
+        self.opportunity_norm = float(self.opportunity_norm)
+        self.execution_norm = float(self.execution_norm)
 
 
 # ---------------------------------------------------------------------------
