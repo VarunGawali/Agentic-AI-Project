@@ -519,7 +519,7 @@ def node_market_intel(state: AgentState) -> dict:
             "  recommended_strategy_families (array from: staggered, trigger, volatility, hybrid)\n"
             "  trigger_thresholds (array of 2-3 floats between 0.90 and 1.20)\n"
             "  vol_scale_ks      (array of 2-3 floats between 0.0 and 3.0)\n"
-            "  w_cvar_boost      (float, 0.0-2.0: extra CVaR weight for this regime)\n"
+            "  w_cvar_boost      (float, 0.0-0.5: extra CVaR weight for this regime; keep small)\n"
             "  w_opportunity_boost (float, 0.0-1.0: extra opportunity weight)\n\n"
             "Respond with ONLY valid JSON after calling the tools."
         )
@@ -764,6 +764,17 @@ def node_explore_dispatch(state: AgentState) -> list[Send]:
 # Node: evaluate_family  (one instance per family, run in parallel via Send)
 # ---------------------------------------------------------------------------
 
+def _extract_history_arrays(history: "PriceHistory | None") -> "tuple[np.ndarray | None, float | None]":
+    """Extract monthly price array and long-run vol from PriceHistory for path-dependent strategies."""
+    if history is None:
+        return None, None
+    prices = np.asarray(history.prices, dtype=float)
+    if len(prices) < 2:
+        return None, None
+    long_run_vol = float(np.std(np.diff(np.log(prices[prices > 0])))) if len(prices) > 1 else None
+    return prices, long_run_vol
+
+
 def node_evaluate_family(state: AgentState) -> dict:
     """
     Evaluate all candidates for one strategy family.
@@ -780,6 +791,8 @@ def node_evaluate_family(state: AgentState) -> dict:
         logger.info("[evaluate_family/%s] No candidates — skipped.", family_name)
         return {"family_results": []}
 
+    price_history, long_run_vol = _extract_history_arrays(state.get("history"))
+
     results = evaluate_candidates(
         forecast_obj=forecast_obj,
         exposure=exposure,
@@ -788,6 +801,8 @@ def node_evaluate_family(state: AgentState) -> dict:
         candidates=candidates,
         mode="accurate",
         compute_ci=False,
+        price_history=price_history,
+        long_run_vol=long_run_vol,
     )
 
     logger.info("[evaluate_family/%s] %d candidates evaluated.", family_name, len(results))
@@ -809,6 +824,8 @@ def node_explore_collect(state: AgentState) -> dict:
     forward_price = state["forward_price"]
 
     all_results: list[dict] = list(state.get("family_results", []))
+
+    price_history, long_run_vol = _extract_history_arrays(state.get("history"))
 
     # --- CVaR-LP optimized candidate ---
     lp_msg = "[node_explore_collect] CVaR-LP skipped."
@@ -835,6 +852,8 @@ def node_explore_collect(state: AgentState) -> dict:
             candidates=[cvar_lp_params],
             mode="accurate",
             compute_ci=False,
+            price_history=price_history,
+            long_run_vol=long_run_vol,
         )
         all_results.extend(lp_results)
         lp_msg = "[node_explore_collect] CVaR-LP candidate added."
@@ -923,6 +942,10 @@ def node_arbitrate(state: AgentState) -> dict:
             w_cvar_boost = float(market_ctx.get("w_cvar_boost", 0.0))
             w_opp_boost = float(market_ctx.get("w_opportunity_boost", 0.0))
 
+            # Cap boosts so LLM cannot override more than 50% of user weights
+            w_cvar_boost = min(w_cvar_boost, risk.w_cvar * 0.5)
+            w_opp_boost = min(w_opp_boost, risk.w_opportunity * 0.5)
+
             if w_cvar_boost != 0.0 or w_opp_boost != 0.0:
                 adjusted_risk = dataclasses.replace(
                     risk,
@@ -975,6 +998,10 @@ def node_arbitrate(state: AgentState) -> dict:
                 f"Candidates (re-scored for current regime):\n{chr(10).join(rows)}\n\n"
                 f"Client base weights: CVaR={risk.w_cvar:.2f}, "
                 f"max hedge={risk.max_hedge:.0%}\n\n"
+                "The candidate at index 0 has the lowest blended score after regime adjustment.\n"
+                "Select index 0 UNLESS there is a strong, specific regime reason to deviate "
+                "(e.g. extreme volatility spike favours a trigger strategy already ranked close to top).\n"
+                "If you deviate, explain exactly why in REASON.\n"
                 "Respond exactly:\n"
                 "REASON: <one sentence incorporating market context>\n"
                 "INDEX: <integer>"

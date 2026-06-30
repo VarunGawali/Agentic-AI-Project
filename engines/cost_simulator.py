@@ -183,6 +183,8 @@ def simulate_cost(
     n_boot: int = 500,
     ci_alpha: float = 0.95,
     seed: int = 0,
+    price_history: "np.ndarray | None" = None,
+    long_run_vol: "float | None" = None,
 ) -> CostDistribution:
     """
     Simulate total procurement cost distribution.
@@ -224,6 +226,8 @@ def simulate_cost(
             volumes=volumes,
             params=params,
             fwd_curve=fwd_curve,
+            price_history=price_history,
+            long_run_vol=long_run_vol,
         )
 
     else:
@@ -308,6 +312,8 @@ def _simulate_cost_accurate(
     volumes: np.ndarray,
     params: StrategyParams,
     fwd_curve: np.ndarray,
+    price_history: "np.ndarray | None" = None,
+    long_run_vol: "float | None" = None,
 ) -> np.ndarray:
     """
     Path-wise simulation.
@@ -328,6 +334,8 @@ def _simulate_cost_accurate(
         hedge_fractions = apply_strategy(
             params=params,
             price_path=price_path,
+            price_history=price_history,
+            long_run_vol=long_run_vol,
         )
 
         _validate_hedge_fractions(

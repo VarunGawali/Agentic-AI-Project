@@ -241,10 +241,13 @@ def score_policy(
         Score =
             w_cost * Expected Cost
           + w_cvar * CVaR
-          + w_opportunity * Opportunity Cost
+          + w_opportunity * Opportunity Cost (normalized by baseline)
           + w_execution * Execution Risk
 
     Lower blended score is better.
+    Opportunity cost is normalized by no-hedge mean cost so it contributes
+    as a fractional penalty rather than a raw dollar amount, preventing it
+    from dominating in regimes where forward > E[spot].
     """
 
     cost_factor = float(cost.mean)
@@ -262,10 +265,15 @@ def score_policy(
         execution_cost_per_barrel=execution_cost_per_barrel,
     )
 
+    # Normalize opportunity cost by baseline so it is a fraction of no-hedge cost.
+    # This prevents it from dominating when forward > E[spot] (contango regime).
+    baseline_mean = abs(float(no_hedge_cost.mean)) if no_hedge_cost is not None else 1.0
+    opp_normalized = opportunity_cost / baseline_mean if baseline_mean > 0 else 0.0
+
     blended = (
         risk.w_cost * cost_factor
         + risk.w_cvar * cvar_factor
-        + risk.w_opportunity * opportunity_cost
+        + risk.w_opportunity * opp_normalized * cost_factor
         + risk.w_execution * execution_risk
     )
 
@@ -294,6 +302,8 @@ def evaluate_candidates(
     execution_cost_per_barrel: float = 0.05,
     no_hedge_cost: "CostDistribution | None" = None,
     n_jobs: int = 4,
+    price_history: "np.ndarray | None" = None,
+    long_run_vol: "float | None" = None,
 ) -> list[dict]:
     """
     Evaluate hedge candidates and return ranked results.
@@ -384,6 +394,8 @@ def evaluate_candidates(
             cvar_alpha=risk.cvar_alpha,
             mode=mode,
             compute_ci=compute_ci,
+            price_history=price_history,
+            long_run_vol=long_run_vol,
         )
 
         score = score_policy(
