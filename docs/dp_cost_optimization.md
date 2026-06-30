@@ -1,5 +1,19 @@
 # Phase 4: DP-Based Cost Optimization
 
+> **Implementation status (delivered).** The DP solver was already implemented in
+> `engines/strategy_library.py` as `build_dp_table()` (Bellman backward induction
+> over a `(period, price_bin, vol_bin)` state space) with the lookup handled by the
+> `DP_OPTIMAL` branch of `apply_strategy()`. `StrategyParams.dp_table` is a
+> **dict** `{(t, price_bin, vol_bin) -> fraction}`, not an ndarray. So the separate
+> `dp_state.py` / `dp_optimizer.py` files and the contracts change in Steps 1, 2 and
+> 5 below were **not needed**. The only remaining work was wiring (Step 4): the DP
+> candidate is now built once in `node_explore_collect`, evaluated via the accurate
+> path-wise simulator (which receives `price_history` + `long_run_vol`), pool-
+> normalized by `blend_scores()` alongside the heuristics + CVaR-LP, and ranked by
+> the arbitrate node. `generate_batch_candidates()` keeps its defensive guard — the
+> family dispatcher never routes `dp_optimal` through it, so Step 6 is moot. The
+> original design write-up is retained below for reference.
+
 ## Motivation
 
 The current pipeline is a **heuristic search**: it generates ~20 candidate strategies

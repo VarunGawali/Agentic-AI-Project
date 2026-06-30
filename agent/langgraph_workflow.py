@@ -76,6 +76,7 @@ from hedging_assistant.engines.forecaster import forecast
 from hedging_assistant.engines.strategy_library import (
     build_policy,
     generate_batch_candidates,
+    build_dp_table,
 )
 from hedging_assistant.engines.cost_simulator import simulate_cost
 from hedging_assistant.engines.scorer import evaluate_candidates, blend_scores
@@ -863,6 +864,56 @@ def node_explore_collect(state: AgentState) -> dict:
 
     logger.info("%s", lp_msg)
 
+    # --- DP-optimal candidate (Bellman backward induction over price/vol state) ---
+    dp_msg = "[node_explore_collect] DP-optimal skipped."
+    try:
+        dp_table = build_dp_table(
+            forecast_obj=forecast_obj,
+            exposure=exposure,
+            forward_price=forward_price,
+            max_hedge=risk.max_hedge,
+            n_actions=11,
+            cost_weight=risk.w_cost,
+            cvar_weight=risk.w_cvar,
+            cvar_alpha=risk.cvar_alpha,
+            price_history=price_history,
+            long_run_vol=long_run_vol,
+        )
+
+        if dp_table:
+            dp_mean_frac = float(np.mean(list(dp_table.values())))
+        else:
+            dp_mean_frac = float(risk.max_hedge) * 0.5
+
+        dp_params = StrategyParams(
+            strategy_type=StrategyType.DP_OPTIMAL,
+            base_fraction=min(dp_mean_frac, float(risk.max_hedge)),
+            cap=risk.max_hedge,
+            dp_table=dp_table,
+        )
+
+        dp_results = evaluate_candidates(
+            forecast_obj=forecast_obj,
+            exposure=exposure,
+            risk=risk,
+            forward_price=forward_price,
+            candidates=[dp_params],
+            mode="accurate",
+            compute_ci=False,
+            price_history=price_history,
+            long_run_vol=long_run_vol,
+        )
+        all_results.extend(dp_results)
+        dp_msg = (
+            f"[node_explore_collect] DP-optimal candidate added "
+            f"(mean hedge {dp_mean_frac:.0%}, {len(dp_table)} states)."
+        )
+
+    except Exception as exc:
+        dp_msg = f"[node_explore_collect] DP-optimal skipped: {exc}"
+
+    logger.info("%s", dp_msg)
+
     # --- No-hedge baseline ---
     no_hedge_params = StrategyParams(
         strategy_type=StrategyType.STAGGERED,
@@ -905,7 +956,7 @@ def node_explore_collect(state: AgentState) -> dict:
         "results": all_results,
         "records": records,
         "no_hedge_cost": no_hedge_cost,
-        "trace_messages": state.get("trace_messages", []) + [lp_msg, msg],
+        "trace_messages": state.get("trace_messages", []) + [lp_msg, dp_msg, msg],
     }
 
 

@@ -16,6 +16,7 @@ const STRATEGY_COLORS = {
   volatility: '#34d399',
   hybrid:     '#f59e0b',
   cvar_lp:    '#f472b6',
+  dp_optimal: '#22d3ee',
 }
 
 const STRATEGY_LABELS = {
@@ -24,6 +25,7 @@ const STRATEGY_LABELS = {
   volatility: 'Volatility',
   hybrid:     'Hybrid',
   cvar_lp:    'CVaR-LP',
+  dp_optimal: 'DP-Optimal',
 }
 
 function dotColor(d) {
