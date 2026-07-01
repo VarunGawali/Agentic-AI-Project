@@ -29,6 +29,7 @@ from pathlib import Path
 import joblib
 from hedging_assistant.engines.xgb_garch_forecaster import forecast_xgb_garch_t
 from hedging_assistant.engines.ml_vol_forecaster import forecast_ml_vol_t
+from hedging_assistant.engines.ensemble_forecaster import forecast_ensemble_t
 import numpy as np
 import pandas as pd
 import scipy.stats
@@ -520,11 +521,30 @@ def forecast(
     if n_paths <= 0:
         raise ValueError("n_paths must be greater than 0.")
 
-    if model not in {"xgb-garch-t", "xgb-vol-t", "ml-vol-t", "gbm", "normal", "student-t"}:
+    if model not in {"xgb-garch-t", "xgb-vol-t", "ml-vol-t", "ensemble-t",
+                     "gbm", "normal", "student-t"}:
         raise ValueError(
-            "model must be one of: 'xgb-garch-t', 'xgb-vol-t', 'gbm', 'normal', "
-            "'student-t'."
+            "model must be one of: 'xgb-garch-t', 'xgb-vol-t', 'ensemble-t', "
+            "'gbm', 'normal', 'student-t'."
         )
+
+    # Ensemble volatility forecaster (monthly only; daily/weekly -> student-t GBM).
+    if model == "ensemble-t":
+        if frequency != "M":
+            logger.warning(
+                "ensemble-t targets monthly procurement; frequency=%s -> student-t GBM.",
+                frequency,
+            )
+            model = "student-t"
+        else:
+            return forecast_ensemble_t(
+                history=history,
+                horizon=horizon,
+                n_paths=n_paths,
+                seed=seed,
+                calibration_window=calibration_window or 1500,
+                daily_steps={"D": 1, "W": 5, "M": 21}["M"],
+            )
 
     # -----------------------------------------------------------------------
     # XGB-Vol-t forecaster: ML predicts VOLATILITY (the forecastable signal);

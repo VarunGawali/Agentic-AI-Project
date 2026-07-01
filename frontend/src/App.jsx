@@ -404,7 +404,8 @@ export default function App() {
 
           <div className="model-toggle">
             {[
-              { key: 'xgb-garch-t', label: 'XGB + GARCH-t', monthlyOnly: true },
+              { key: 'xgb-garch-t', label: 'XGB Volatility', monthlyOnly: true },
+              { key: 'ensemble-t', label: 'XGB Ensemble', monthlyOnly: true },
               { key: 'student-t', label: 'GBM Student-t', monthlyOnly: false },
             ].map(({ key, label, monthlyOnly }) => {
               const disabled = monthlyOnly && params.frequency !== 'M'

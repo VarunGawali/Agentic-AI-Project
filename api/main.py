@@ -59,6 +59,7 @@ from contracts import (
 from agent.langgraph_workflow import run_agent
 from engines.cost_simulator import simulate_cost
 from engines.forward_curve import build_parametric_curve, implied_annual_carry
+from data.loader import load_forward_curve
 
 # ---------------------------------------------------------------------------
 # Price history cache — refreshed at most once per hour to avoid repeated
@@ -142,6 +143,14 @@ class RecommendRequest(BaseModel):
             "(1+carry)^(t/periods_per_year)."
         ),
     )
+    use_eia_futures: bool = Field(
+        False,
+        description=(
+            "If true, build the forward curve from real EIA WTI futures (RCLC1-4, "
+            "front + extrapolated tail) instead of the parametric forward_carry. "
+            "Falls back to a flat curve at forward_price if the fetch fails."
+        ),
+    )
     barrels_per_period: float = Field(
         100_000,
         gt=0,
@@ -179,7 +188,7 @@ class RecommendRequest(BaseModel):
     )
     model: str = Field(
         "xgb-garch-t",
-        pattern="^(xgb-garch-t|gbm|normal|student-t|hmm)$",
+        pattern="^(xgb-garch-t|xgb-vol-t|ensemble-t|gbm|normal|student-t|hmm)$",
         description="Forecast model.",
     )
     n_paths: int = Field(
@@ -547,21 +556,34 @@ def recommend(req: RecommendRequest) -> dict:
             distribution = "normal"
             model = "gbm"
             use_regime = False
+        elif req.model == "ensemble-t":
+            distribution = "normal"
+            model = "ensemble-t"
+            use_regime = False
         else:
             distribution = "normal"
             model = "xgb-garch-t"
             use_regime = False
 
-        # Build the forward CURVE from the front price + annualized carry.
-        # A non-zero carry (contango/backwardation) is what gives the optimizer a
-        # real basis to exploit — with a flat curve (carry=0) hedging has zero
-        # expected effect and the decision collapses to a pure risk trade-off.
-        forward_curve = build_parametric_curve(
-            spot=req.forward_price,
-            horizon=req.horizon,
-            annual_carry=req.forward_carry,
-            frequency=req.frequency,
-        )
+        # Build the forward CURVE. Either from real EIA WTI futures (RCLC1-4) or
+        # from the front price + a parametric carry (contango/backwardation). A
+        # non-flat curve is what gives the optimizer a real basis to exploit —
+        # with a flat curve hedging has zero expected effect and the decision
+        # collapses to a pure risk trade-off.
+        if req.use_eia_futures:
+            forward_curve = load_forward_curve(
+                horizon=req.horizon,
+                symbol="WTI",
+                frequency=req.frequency,
+                spot=req.forward_price,
+            )
+        else:
+            forward_curve = build_parametric_curve(
+                spot=req.forward_price,
+                horizon=req.horizon,
+                annual_carry=req.forward_carry,
+                frequency=req.frequency,
+            )
 
         # NOTE:
         # This assumes run_agent has been/will be updated to accept `model`.

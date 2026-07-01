@@ -70,6 +70,14 @@ SERIES = {
     "BRENT": "RBRTE",
 }
 
+# NYMEX WTI (Cushing) futures contracts 1-4 — the real forward curve, same EIA
+# petroleum dataset / API key as spot, just the `fut` endpoint.
+EIA_FUT_BASE = "https://api.eia.gov/v2/petroleum/pri/fut/data/"
+
+FUTURES_SERIES = {
+    "WTI": ["RCLC1", "RCLC2", "RCLC3", "RCLC4"],
+}
+
 DEFAULT_DATA_DIR = Path("data/raw")
 
 
@@ -236,6 +244,101 @@ def fetch_eia_price_data(
     df["source"] = "EIA"
 
     return df.reset_index(drop=True)
+
+
+def fetch_eia_futures_curve(
+    symbol: str = "WTI",
+    api_key: str | None = None,
+    lookback_days: int = 10,
+) -> list[float]:
+    """
+    Fetch the latest NYMEX futures curve (contracts 1-4) from EIA.
+
+    Returns the most recent quote for each of RCLC1..RCLC4 as a list of prices
+    [F1, F2, F3, F4]. Contracts with no recent data are dropped (shorter list).
+
+    Requires EIA_API_KEY (same key as spot). Raises if unavailable.
+    """
+    symbol = symbol.upper()
+    if symbol not in FUTURES_SERIES:
+        raise ValueError(f"No futures series configured for {symbol}.")
+
+    api_key = api_key or os.environ.get("EIA_API_KEY")
+    if not api_key:
+        raise ValueError("EIA_API_KEY not found; cannot fetch futures curve.")
+
+    session = _make_retry_session()
+    start = (pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    params = {
+        "api_key": api_key,
+        "frequency": "daily",
+        "data[0]": "value",
+        "start": start,
+        "sort[0][column]": "period",
+        "sort[0][direction]": "desc",
+        "length": 200,
+    }
+    # one facet per contract series
+    for series_id in FUTURES_SERIES[symbol]:
+        params.setdefault("facets[series][]", [])
+    # requests encodes a list value as repeated params
+    params["facets[series][]"] = FUTURES_SERIES[symbol]
+
+    response = session.get(EIA_FUT_BASE, params=params, timeout=30)
+    response.raise_for_status()
+    rows = response.json().get("response", {}).get("data", [])
+
+    # latest value per series
+    latest: dict[str, float] = {}
+    latest_date: dict[str, str] = {}
+    for row in rows:
+        sid = row.get("series")
+        period = row.get("period", "")
+        try:
+            val = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if sid not in latest_date or period > latest_date[sid]:
+            latest_date[sid] = period
+            latest[sid] = val
+
+    curve = [latest[sid] for sid in FUTURES_SERIES[symbol] if sid in latest]
+    if not curve:
+        raise ValueError("EIA returned no futures quotes for the requested window.")
+    return curve
+
+
+def load_forward_curve(
+    horizon: int,
+    symbol: str = "WTI",
+    frequency: str = "M",
+    spot: float | None = None,
+    api_key: str | None = None,
+):
+    """
+    Build a ForwardCurve of length `horizon` from real EIA futures contracts 1-4,
+    extrapolating the tail with the front log-slope. Falls back to a flat curve at
+    `spot` if the futures fetch fails.
+
+    Returns a hedging_assistant.contracts.ForwardCurve.
+    """
+    from hedging_assistant.engines.forward_curve import (
+        build_curve_from_futures,
+        build_parametric_curve,
+    )
+
+    if spot is None:
+        # anchor at the latest spot if not supplied
+        hist = load_price_history(symbol=symbol)
+        spot = float(hist["price"].iloc[-1])
+
+    try:
+        front = fetch_eia_futures_curve(symbol=symbol, api_key=api_key)
+        return build_curve_from_futures(front, spot=spot, horizon=horizon, frequency=frequency)
+    except Exception as exc:  # network / key / no data
+        logger.warning("Futures curve fetch failed (%s); using flat curve at spot.", exc)
+        return build_parametric_curve(spot, horizon, 0.0, frequency, source="spot-fallback")
 
 
 def merge_price_data(

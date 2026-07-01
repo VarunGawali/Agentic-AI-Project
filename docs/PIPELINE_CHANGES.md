@@ -69,8 +69,14 @@ by trailing-CRPS dynamic weights, driftless Student-t simulation.
 **Finding:** the ensemble **matches** the single XGB-Vol-t on CRPS (the selector
 correctly concentrates on the best member) with slightly better tail coverage
 (93% vs 91%). Its value is **robustness/insurance across regimes**, not raw
-accuracy on this data. Recommended future use: feed the ensemble *distribution*
-into the CVaR-LP for decision robustness (not yet wired).
+accuracy on this data.
+
+**Productionized** as `engines/ensemble_forecaster.py` (`forecast_ensemble_t`,
+"XGB-Ensemble-t"), selectable via `model="ensemble-t"` through the dispatcher /
+API / frontend ("XGB Ensemble"). It pools driftless Student-t paths across the
+three members (weighted mixture), so **model disagreement widens the tails** — and
+because the agent's LP consumes exactly those paths, selecting the ensemble model
+*is* the "ensemble distribution → CVaR-LP" robustness wiring.
 
 ---
 
@@ -101,8 +107,11 @@ into the CVaR-LP for decision robustness (not yet wired).
 - `build_parametric_curve(spot, horizon, annual_carry, frequency)` — scenario curve
   `F_t = spot·(1+carry)^(t/ppy)`; `carry<0` backwardation, `>0` contango.
 - `build_curve_from_futures(front_contracts, …)` — real EIA WTI futures
-  (`RCLC1–4`) front + log-slope tail extrapolation (loader fetch is a TODO; needs
-  the EIA key, same as spot).
+  (`RCLC1–4`) front + log-slope tail extrapolation. Loader implemented:
+  `data/loader.py` gains `fetch_eia_futures_curve()` (RCLC1–4 from the EIA `fut`
+  endpoint, same key as spot) and `load_forward_curve()` (builds the curve, flat
+  fallback if the fetch fails). API `use_eia_futures=true` switches from the
+  parametric carry to the real curve.
 - `implied_annual_carry(...)` for reporting.
 
 **Wired into the live product:**
@@ -184,8 +193,11 @@ DP candidate), `api/main.py` (forward curve wiring), `frontend/src/App.jsx`
 
 ## 9. Roadmap
 
-1. Wire the **ensemble distribution → CVaR-LP** for decision robustness.
-2. **EIA `RCLC1–4` futures** loader for the real forward curve.
+1. ~~Wire the **ensemble distribution → CVaR-LP**~~ — done (select `ensemble-t`).
+2. ~~**EIA `RCLC1–4` futures** loader~~ — done (`load_forward_curve`,
+   `use_eia_futures`); needs a live EIA key to exercise the real fetch.
 3. **Storage/inventory DP** module (if users have physical storage).
 4. Retire the obsolete heuristic strategies / dead legacy modules
    (`engines/engines.py`, `agent/langgraph_agent.py`, `agent/orchestrator.py`).
+5. Backtest ensemble-LP vs single-LP realized cost/CVaR (expected: marginal, since
+   the ensemble's edge is tail robustness, not point accuracy).
