@@ -58,6 +58,7 @@ from contracts import (
 
 from agent.langgraph_workflow import run_agent
 from engines.cost_simulator import simulate_cost
+from engines.forward_curve import build_parametric_curve, implied_annual_carry
 
 # ---------------------------------------------------------------------------
 # Price history cache — refreshed at most once per hour to avoid repeated
@@ -128,7 +129,18 @@ class RecommendRequest(BaseModel):
     forward_price: float = Field(
         95.0,
         gt=0,
-        description="Forward/hedge price in USD per barrel.",
+        description="Front forward/hedge price in USD per barrel (curve anchor).",
+    )
+    forward_carry: float = Field(
+        0.0,
+        ge=-0.5,
+        le=0.5,
+        description=(
+            "Annualized forward-curve slope. >0 = contango (forward rises above "
+            "spot, hedging costs more), <0 = backwardation (forward below spot, "
+            "hedging is cheap), 0 = flat curve. Builds F_t = forward_price * "
+            "(1+carry)^(t/periods_per_year)."
+        ),
     )
     barrels_per_period: float = Field(
         100_000,
@@ -237,10 +249,12 @@ def _build_period_costs(
     forecast_obj,
     hedge_fractions: np.ndarray,
     volumes: np.ndarray,
-    forward_price: float,
+    forward_price,
 ) -> dict:
     """
     Build median per-period hedged and no-hedge costs in millions.
+
+    forward_price may be a scalar or a per-period forward curve (array).
 
     Returns:
         dict with hedged_cost and no_hedge_cost lists, one value per period.
@@ -249,7 +263,9 @@ def _build_period_costs(
     paths = np.asarray(forecast_obj.paths, dtype=float)
     n_paths, horizon = paths.shape
 
-    fwd = np.full(horizon, float(forward_price))
+    fwd = np.asarray(forward_price, dtype=float)
+    if fwd.ndim == 0:
+        fwd = np.full(horizon, float(fwd))
     fracs = np.asarray(hedge_fractions, dtype=float)
 
     hedged_per_period = (fracs * volumes * fwd) + ((1 - fracs) * volumes * np.median(paths, axis=0))
@@ -536,13 +552,24 @@ def recommend(req: RecommendRequest) -> dict:
             model = "xgb-garch-t"
             use_regime = False
 
+        # Build the forward CURVE from the front price + annualized carry.
+        # A non-zero carry (contango/backwardation) is what gives the optimizer a
+        # real basis to exploit — with a flat curve (carry=0) hedging has zero
+        # expected effect and the decision collapses to a pure risk trade-off.
+        forward_curve = build_parametric_curve(
+            spot=req.forward_price,
+            horizon=req.horizon,
+            annual_carry=req.forward_carry,
+            frequency=req.frequency,
+        )
+
         # NOTE:
         # This assumes run_agent has been/will be updated to accept `model`.
         recommendation = run_agent(
             history=history,
             exposure=exposure,
             risk=risk,
-            forward_price=req.forward_price,
+            forward_price=forward_curve.prices,
             frequency=req.frequency,
             n_paths=req.n_paths,
             seed=42,
@@ -603,7 +630,7 @@ def recommend(req: RecommendRequest) -> dict:
                     forecast_obj=forecast_obj,
                     hedge_fractions=recommendation.policy.hedge_fractions,
                     volumes=exposure.volumes,
-                    forward_price=req.forward_price,
+                    forward_price=forward_curve.prices,
                 )
             except Exception:
                 period_costs = None
@@ -621,6 +648,8 @@ def recommend(req: RecommendRequest) -> dict:
                 for f in recommendation.policy.hedge_fractions.tolist()
             ],
             "forward_price": req.forward_price,
+            "forward_carry": req.forward_carry,
+            "forward_curve": [round(float(x), 2) for x in forward_curve.prices.tolist()],
             "model_name": assumptions.get("forecast_model", model),
             "frequency": assumptions.get("frequency", req.frequency),
             "n_paths": assumptions.get("n_paths", req.n_paths),

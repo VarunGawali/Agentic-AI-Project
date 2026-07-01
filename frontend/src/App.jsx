@@ -12,6 +12,7 @@ const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
 const DEFAULT_PARAMS = {
   forward_price: 95,
+  forward_carry: 0,
   barrels_per_period: 100000,
   horizon: 6,
   max_hedge: 1.0,
@@ -288,6 +289,20 @@ export default function App() {
             step={1}
             fmt={v => `$${v}/bbl`}
             onChange={v => handleSliderChange('forward_price', v)}
+          />
+
+          <Slider
+            label="Curve Shape"
+            value={params.forward_carry}
+            min={-0.2}
+            max={0.2}
+            step={0.01}
+            fmt={v =>
+              v > 0.001 ? `contango +${Math.round(v * 100)}%` :
+              v < -0.001 ? `backwardation ${Math.round(v * 100)}%` :
+              'flat'
+            }
+            onChange={v => handleSliderChange('forward_carry', v)}
           />
 
           <Slider
