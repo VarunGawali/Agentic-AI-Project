@@ -135,10 +135,24 @@ in the core hedge decision — the convex CVaR-LP owns that.
 Its honest home is **`engines/mpc.py` (`receding_horizon_execute`)**: at each period,
 re-forecast vol, re-anchor the curve, re-solve the CVaR-LP for the remaining horizon,
 execute the front action, advance. That is Bellman-by-re-optimization ("MPC =
-approximate DP"), reusing the existing LP. Trade-off: open-loop locks the full curve
-(captures basis); MPC adapts to vol at rolling near-forwards. Backtest results in
-`scripts`/scratchpad. (A physical **storage/inventory DP** is the one place a true
-DP beats the LP and cuts cost — deferred to roadmap; needs storage cost/capacity data.)
+approximate DP"), reusing the existing LP.
+
+**Backtest finding (open-loop vs MPC) — they have opposite, economically-coherent
+strengths:**
+
+| Forward curve | Open-loop LP savings | MPC savings |
+|---|---|---|
+| backwardation −6% | **+1.74%** | +0.16% |
+| contango +6% | −1.76% | **−0.85%** |
+
+Open-loop locks the *whole* curve at t=0, so it captures the cheap far-month
+forwards in **backwardation**. MPC hedges progressively at rolling near-forwards and
+stays flexible, so it avoids over-committing to expensive forwards in **contango**.
+Practical rule: lock the curve (open-loop) when it's backwardated; prefer MPC's
+flexibility when it's in contango.
+
+(A physical **storage/inventory DP** is the one place a true DP beats the LP and cuts
+cost — deferred to roadmap; needs storage cost/capacity data.)
 
 ---
 
